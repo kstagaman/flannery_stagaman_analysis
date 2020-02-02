@@ -1,0 +1,2287 @@
+---
+title: "Fisher Metagenomes - With Subscales - 12 Aug 2019 Data"
+output: 
+  html_document: 
+    highlight: textmate
+    keep_md: yes
+---
+
+## Setup
+
+```{r setup-pkgs-scripts, include=FALSE}
+source("packages_and_sources.R")
+# source("../Aux_scripts/colorblind_pals.R")
+packages.bibtext <- "flannery_stagaman_et_al_R_packages.bib"
+write_bib((.packages()), file = packages.bibtext) # from knitr
+# Set options
+options(knitr.table.format = "html")
+.pardefault <- par(no.readonly = T)
+theme_set(theme_cowplot())
+figure_theme <- theme_update(
+  plot.background = element_blank(),
+  plot.title = element_text(size = 12),
+  plot.subtitle = element_text(face = "italic", size = 8),
+  panel.background = element_blank(),
+  panel.grid = element_blank(),
+  axis.text = element_text(size = 6),
+  axis.title = element_text(size = 10),
+  strip.background = element_blank(),
+  strip.text = element_text(size = 8),
+  legend.title = element_text(size = 7),
+  legend.text = element_text(size = 5),
+  legend.box.background = element_blank(),
+  legend.key = element_blank()
+)
+opts_chunk$set(
+  echo = FALSE,
+  tidy = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  # out.width = 650,
+  # out.height = 650 * 0.6,
+  dpi = 300
+)
+
+```
+
+```{r setup-vars-data, include=FALSE}
+###### SET VARIABLES ######
+main.seed <- 1337
+set.seed(main.seed)
+nproc <- 3
+pnas.1col <- 3.42 # inches
+pnas.2col <- 7 # inches
+pnas.max.ht <- 9 # inches
+outer.pt.sz <- 3.8
+inner.pt.sz <- outer.pt.sz / 2
+lab.font.pt <- 6
+lab.size <- lab.font.pt * 0.35
+seg.size <- 0.75
+cb.pal <- getCB.pal("gray")
+blue_to_red <- c("#2c7bb6", "#abd9e9", "#fdae61", "#d7191c")
+purple_to_green <- c("#7b3294", "#c2a5cf", "#a6dba0", "#008837")
+dist.method.name <- "Bray-Curtis"
+dist.method <- "bray"
+ord.method <- "PCoA"
+nAxes <- 3 # number of axes to generate in the PCoA ordinations
+kegg.remap <- FALSE
+kegg.map.files <- c(
+  "Static_data/map_kos_mod.rds",
+  "Static_data/my_kos_mods_clpsd.rds"
+)
+meta.data.file <- "Static_data/stool_combine_diet_729_2019-08-12.csv"
+# check filetype of metadata file
+if (grepl(".txt", meta.data.file)) {
+  data.file.sep <- "\t"
+} else if (grepl(".csv", meta.data.file)) {
+  data.file.sep <- ","
+} else {
+  stop("Meta-data file type not recognized")
+}
+data.date <- {
+  strsplit(meta.data.file, split = ".", fixed = T)[[1]][1] %>% strsplit(split = "_")
+}[[1]] %>%
+  tail(1) # grab date from metadata file name
+# name and create directories for saving objects and plots
+saveDir <- paste("Saved_objs", data.date, "data", sep = "_")
+if (!dir.exists(saveDir)) {
+  dir.create(saveDir)
+  cat(paste(saveDir, "created"))
+}
+# figDir <- "Figure_plots"
+# if (!dir.exists(figDir)) {
+#   dir.create(figDir)
+#   cat(paste(figDir, "created"))
+# }
+
+###### IMPORT DATA ######
+merged.abund.stats <- read.csv("Static_data/merged_abund_stats.csv", header = TRUE) # abundance stats file
+merged.rel.abunds <- readRDS("Static_data/shotmap_merged_rel_abunds.rds") # KO relative abundances data
+metaphlan.tax.tbl <- readRDS("Static_data/metaphlan_lowest_tax_tbl.rds") # taxon abundance table
+# file containing covar names and descriptions
+vars.legend <- read.table(
+  "Static_data/variables_legend_2019-08-12.txt",
+  sep = "\t",
+  header = TRUE,
+  na.strings = "N/A",
+  stringsAsFactors = FALSE
+) %>% as.data.table()
+setkey(vars.legend, var.name)
+# a data.frame with covariate categories
+varIDs <- data.table(
+  "group" = c(
+    "intr",           "intr",       "ctrl", "intr",        "ctrl",  "ctrl"
+  ),
+  "varID" = c(
+    "parent_",   "child_behav_",      "demo_", "esa_",        "gut_", "Diet_"
+  ),
+  "name" =  c(
+    "Parenting", "Child Behavior", "Demography",  "ESA", "Gut-related",  "Diet"
+  ),
+  stringsAsFactors = FALSE
+)
+# grab only stool samples
+stool.kos.rel.abunds <- merged.rel.abunds[grepl("SP", row.names(merged.rel.abunds)), ]
+# remove sample SP001 in favor of sample SP001_2 which had better coverage (sample sample source)
+stool.kos.rel.abunds <- stool.kos.rel.abunds[-c(3, 4), ]
+# rename rows to simple SP003_R1, SP003_R2 format
+row.names(stool.kos.rel.abunds) <- paste(
+  sapply(strsplit(row.names(stool.kos.rel.abunds), "_S"), `[`, 1),
+  c(str_match(row.names(stool.kos.rel.abunds), "R[12]")),
+  sep = "_"
+)
+# import metadata
+stool.metadata <- read.table(
+  meta.data.file,
+  header = TRUE,
+  row.names = 2,
+  sep = data.file.sep,
+  na.strings = "NA",
+  stringsAsFactors = FALSE
+)
+stool.metadata <- stool.metadata[, -1]
+dropCols <- grep(
+  "_per_sample|grains*_to_|persample|_av_|probiotic", 
+  names(stool.metadata), 
+  value = T
+)
+stool.metadata <- stool.metadata[, -match(dropCols, names(stool.metadata))]
+
+###### CREATE PHYLOSEQ OBJECTS ######
+# create a phyloseq object of all reads and their KO assignments
+(stool.kos.phy <- phyloseq(
+  sample_data(stool.metadata),
+  otu_table(as.matrix(stool.kos.rel.abunds), taxa_are_rows = FALSE)
+))
+# remove samples with fewer than 1,000,000 total reads
+(stool.kos.phy <- subset_samples(stool.kos.phy, Total.Processed.Reads >= 1000000))
+
+# create a phyloseq object of just the foward reads and their KO assignments
+# remove KOs not present in any remaining samples
+stool1.kos.phy <- subset_samples(stool.kos.phy, read == "R1")
+(stool1.kos.phy <- prune_taxa(taxa_sums(stool1.kos.phy) > 0, stool1.kos.phy))
+saveRDS(stool1.kos.phy, file = file.path(saveDir, "phyloseq_stool1_kos.rds"))
+
+# create a phyloseq object of just the reverse reads and their KO assignments
+# remove KOs not present in any remaining samples
+stool2.kos.phy <- subset_samples(stool.kos.phy, read == "R2")
+(stool2.kos.phy <- prune_taxa(taxa_sums(stool2.kos.phy) > 0, stool2.kos.phy))
+saveRDS(stool2.kos.phy, file = file.path(saveDir, "phyloseq_stool2_kos.rds"))
+
+# match remaining samples to the taxon table
+stool.tax.tbl <- metaphlan.tax.tbl[grepl("SP", rownames(metaphlan.tax.tbl)), ]
+# create a phyloseq object of all reads and their taxon assignments
+stool.tax.phy <- phyloseq(
+  sample_data(stool.metadata),
+  otu_table(stool.tax.tbl, taxa_are_rows = FALSE)
+)
+# remove samples with fewer than 1,000,000 total reads
+(stool.tax.phy <- subset_samples(stool.tax.phy, Total.Processed.Reads >= 1000000))
+
+# create a phyloseq object of just the foward reads and their taxon assignments
+# remove taxa not present in any remaining samples
+stool1.tax.phy <- subset_samples(stool.tax.phy, read == "R1")
+(stool1.tax.phy <- prune_taxa(taxa_sums(stool1.tax.phy) > 0, stool1.tax.phy))
+# Split taxon assignments into a table with taxon levels (Phylum to Strain) as columns
+taxa.names <- taxa_names(stool1.tax.phy)
+tax.tbl <- do.call(
+  "rbind",
+  lapply(
+    taxa.names,
+    function(taxon) {
+      tax.split <- strsplit(taxon, "|", fixed = T)[[1]]
+      if (length(tax.split) < 8) {
+        tax.split <- c(tax.split, rep(NA, (8 - length(tax.split))))
+      }
+      tax.row <- sub("\\w__", "", tax.split, perl = T)
+    }
+  )
+)
+colnames(tax.tbl) <- c(
+  "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species", "Strain"
+)
+rownames(tax.tbl) <- taxa.names
+# View(tax.tbl)
+tax_table(stool1.tax.phy) <- tax_table(tax.tbl)
+saveRDS(stool1.tax.phy, file = file.path(saveDir, "phyloseq_stool_r1s_metagenome_taxa.rds"))
+
+# create a phyloseq object of just the reverse reads and their taxon assignments
+# remove taxa not present in any remaining samples
+stool2.tax.phy <- subset_samples(stool.tax.phy, read == "R2")
+(stool2.tax.phy <- prune_taxa(taxa_sums(stool2.tax.phy) > 0, stool2.tax.phy))
+tax_table(stool2.tax.phy) <- tax_table(tax.tbl)
+saveRDS(stool2.tax.phy, file = file.path(saveDir, "phyloseq_stool_r2s_metagenome_taxa.rds"))
+
+# Remap KOs to Modules if required or desired
+if (!all(file.exists(kegg.map.files)) | kegg.remap) {
+  source("Aux_scripts/kegg_maps.R")
+}
+```
+
+## 1. KOs and taxonomic PCoA ordinations
+
+The four PCoA ordinations below represent represent the Bray-Curtis distances for the stool samples based on the forward read data (read1s, plots on left), the reverse read data (read2s; plots on right). The distances were computed for their functional diversity (`shotmap`; KEGG Orthologies; plots on top) and taxonomic diversity (`metaphlan2`; plots on bottom).
+
+```{r ko-and-tax-ords, fig.height=pnas.2col*0.6}
+set.seed(main.seed)
+ord.list <- list() # creating empty list to store ordination objects
+ord.plot.list <- list() # creating empty list to store PCoA plots
+
+# do for both KOs and taxa, this loop will be used in most subsequent analyses
+for (type in c("kos", "tax")) {
+  # do for both forward and reverse reads
+  for (readn in 1:2) {
+    i <- paste(type, readn, sep = "-")
+    # assign correct phyloseq object to `phy.obj`
+    phy.obj <- eval(parse(text = paste("stool", readn, ".", type, ".phy", sep = "")))
+    # ordinate with create method and distance metric
+    ord <- ordinate(phy.obj, method = ord.method, distance = dist.method)
+    # plot ordination and include data for correct number of axes
+    ord.plot <- plot_ordination(phy.obj, ord, label = "smpl", axes = 1:nAxes) +
+      ggtitle(
+        paste(
+          "read", readn, "s ",
+          ifelse(type == "kos", "functional ", "taxonomy "),
+          dist.method.name, " ", ord.method,
+          sep = ""
+        )
+      ) +
+      theme(plot.title = element_text(size = 13))
+    # add ordination objects and plots to respective lists
+    ord.list[[i]] <- ord
+    ord.plot.list[[i]] <- ord.plot
+    # save plot as an RDS file for easy loading in later
+    saveRDS(
+      ord.plot,
+      file = file.path(
+        saveDir,
+        paste("ordPlot_read", readn, "s_",
+              ifelse(type == "kos",
+                     "functional_",
+                     "taxonomy_"
+              ),
+              dist.method.name, "_", ord.method,
+              ".rds",
+              sep = ""
+        )
+      )
+    )
+  }
+}
+n <- length(ord.plot.list)
+nCol <- floor(sqrt(n)) # this should make the panel layout as close to square as possible
+# save ordination list as RDS for easy loading in later
+saveRDS(ord.list, file = file.path(saveDir, "list_ords_pcoa.rds"))
+# show ordinations
+plot_grid(plotlist = ord.plot.list, ncol = 2)
+```
+
+## 2. KOs vs taxonomic Procrustes analyses
+
+To infer whether there's a significant relationship between taxonomic and functional composition/diversity (as implied by that telling cluster of samples mentioned above), we ran a Procrustes analysis (`protest`{`vegan`}) comparing the functional and taxonomic ordinations for both forward and reverse reads sets. We also looked at the correlation between reads 1 and 2 within functional and taxonomic diversity. 
+
+```{r ko-tax-procrustes, cache=TRUE, eval=TRUE}
+set.seed(main.seed)
+# Procrustes tests for all important comparisons
+(r1v2.kvk <- protest(
+  ord.list[["kos-1"]]$vectors, 
+  ord.list[["kos-2"]]$vectors, 
+  permutations = 9999
+))
+(r1v2.tvt <- protest(
+  ord.list[["tax-1"]]$vectors, 
+  ord.list[["tax-2"]]$vectors, 
+  permutations = 9999
+))
+(r1v1.kvt <- protest(
+  ord.list[["kos-1"]]$vectors, 
+  ord.list[["tax-1"]]$vectors, 
+  permutations = 9999
+))
+(r2v2.kvt <- protest(
+  ord.list[["kos-2"]]$vectors, 
+  ord.list[["tax-2"]]$vectors, 
+  permutations = 9999
+))
+
+# Create a table of Procrustes tests results
+prot.res <- data.frame(
+  "read.comp" = c(rep("1 vs. 2", 2), "1 vs. 1", "2 vs. 2"),
+  "type.comp" = c("KOs vs. KOs", "Taxa vs. Taxa", rep("KOs vs. Taxa", 2)),
+  "R2" = round(c(r1v2.kvk$t0, r1v2.tvt$t0, r1v1.kvt$t0, r2v2.kvt$t0), 4),
+  "sig" = c(r1v2.kvk$signif, r1v2.tvt$signif, r1v1.kvt$signif, r2v2.kvt$signif)
+)
+
+# write results table to html (makes it easy to convert to xlsx format with proper styling within Excel)
+(prot.res.html <- prot.res %>%
+    kable(align = c("c", "c", "r", "r")) %>%
+    kable_styling(bootstrap_options = c("hover", "condensed"), full_width = F) %>%
+    collapse_rows(columns = 1:2))
+```
+
+## 3. Variable selection
+
+There are 58 meta-data covariates associated with these microbiome samples. In order to determine which of these variables are most important in influencing the diversity and composition of the microbiomes we ran a set of data reduction steps. We grouped the covariates into 5 categories: Child Behavior, Parenting, Environmental and Social Adveristy (ESA), Demography, and Gut-related. The last two categories contained covariates (such as age, ethnicity, and antibiotic use) that we know can influence the microbiome but that were not the focus of this particular study. Therefore, in subsequent analyes, we first accounted for the effects of the Demographic and Gut-related covariates that most strongly associated with the microbiome before the assessing the associations of the covariates within other categories,.
+
+### Envfit
+
+As a first passs to see which covariates within each category most strongly associated with the microbiome compostion, I applied the function `envfit`{`vegan`} to the same PCoA ordinations produced above (we ran two tests for each covariate category, using the 1st and 2nd PCoA axes, and then the third and fourth). Covariates that were deemed significant are colored in green, non-significant in red. 
+
+```{r envfit-fig-gen, cache=FALSE, include=FALSE, eval=F}
+#### Create Null objects ####
+varSet.kos.12.plots <- NULL
+varSet.tax.12.plots <- NULL
+varSet.kos.34.plots <- NULL
+varSet.tax.34.plots <- NULL
+axes12.r2.data <- data.frame(NULL)
+axes34.r2.data <- data.frame(NULL)
+axis.pc.var <- data.frame()
+
+#### Envfit analyses ####
+for (varID in as.character(varIDs$varID)) { # for each covariate category
+  grep.pattern <- paste("^", varID, sep = "")
+  
+  for (type in c("tax", "kos")) {
+    phy.obj <- eval(parse(text = paste("stool1", type, "phy", sep = ".")))
+    comm.tbl <- otu_table(phy.obj)
+    metadata <- as(sample_data(phy.obj), "data.frame") %>% 
+      as.data.table(keep.rownames = "SmplID")
+    # remove samples with any NAs, otherwise `envfit` will fail
+    keep.cols <- c("SmplID", grep(grep.pattern, names(metadata), value = T))
+    varSet.data <- na.omit(metadata[, ..keep.cols])
+    setkey(varSet.data, SmplID)
+    if (type == "kos") {
+      ord.i <- 1
+    } else {
+      ord.i <- 3
+    }
+    # read in ordination results from list saved above
+    ord <- readRDS(file.path(saveDir, "list_ords_pcoa.rds"))[[ord.i]]
+    # get ordination coordinates for each samples
+    ord.points <- ord$vectors %>% as.data.table(keep.rownames = "SmplID")
+    setkey(ord.points, SmplID)
+    # combine covariate data with ordination coordinates
+    # varSet.ordData <- cbind(varSet.data, varSet.ordPoints)
+    varSet.ordData <- varSet.data[ord.points, nomatch = 0]
+    ord.axes <- grep("Axis", names(varSet.ordData), value = T)
+    varSet.ordPoints <- varSet.ordData[, ..ord.axes]
+    # remove "_R1" from sample names
+    varSet.ordData[, smpl := sub("_R1", "", SmplID)]
+    # create the formula to be used in the `envfit` function
+    # should look like `varSet.ordPoints ~ covar.1 + covar.2 + ... + covar.N`
+    frm <- paste(
+      "varSet.ordPoints ~",
+      paste(sample(names(varSet.data)[-1]),
+            collapse = " + "
+      )
+    )
+    # run `envfit on ordinations of axes 1 & 2, and axes 3 & 4
+    for (first.axis in c(1, 3)) {
+      cat(
+        paste(
+          "varID='", varID, 
+          "'; type='", type, 
+          "'; first.axis=", first.axis, 
+          sep = ""
+        ),
+        sep = "\n"
+      )
+      axes <- c(first.axis, first.axis + 1) # set first and second axes
+      axes.names <- paste("Axis", axes, sep = ".") # set axes names (to match data.frame)
+      # calculate variance explained for each axis
+      var.exp <- round(ord$values$Eigenvalues / sum(ord$values$Eigenvalues) * 100, 1)
+      # create a variance-explained data frame for use in plot
+      var.exp.df <- data.frame(
+        "type" = type,
+        "first.axis" = first.axis,
+        "axis1" = var.exp[first.axis],
+        "axis2" = var.exp[first.axis + 1]
+      )
+      # add this variance-explained df to a larger one for all plots
+      axis.pc.var <- rbind(axis.pc.var, var.exp.df)
+      # run `envfit` analysis
+      set.seed(main.seed)
+      varSet.envfit <- envfit(
+        as.formula(frm),
+        varSet.data,
+        perm = 9999,
+        choices = axes
+      )
+      # extract results for vectors
+      varSet.vectors <- data.frame(
+        as.data.frame(varSet.envfit$vectors$arrows),
+        "r2" = varSet.envfit$vectors$r,
+        "p" = varSet.envfit$vectors$pvals,
+        "name" = mgsub(
+          vars.legend$var.name,
+          vars.legend$description,
+          row.names(varSet.envfit$vectors$arrows)
+        ),
+        stringsAsFactors = F
+      )
+      # extract results for factors
+      varSet.factors <- data.frame(
+        "r2" = varSet.envfit$factors$r,
+        "p" = varSet.envfit$factors$pvals,
+        "name" = mgsub(
+          vars.legend$var.name,
+          vars.legend$description,
+          names(varSet.envfit$factors$r)
+        )
+      )
+      # combine vector and factor results and clean up
+      varSet.vecs.facs <- rbind(varSet.vectors[, -c(1, 2)], varSet.factors)
+      varSet.vecs.facs$var <- row.names(varSet.vecs.facs)
+      varSet.vecs.facs$t <- type
+      row.names(varSet.vecs.facs) <- NULL
+      # append combined results to the proper data.frame for choosing covariates later
+      if (first.axis == 1) {
+        axes12.r2.data <- rbind(axes12.r2.data, varSet.vecs.facs)
+      } else {
+        axes34.r2.data <- rbind(axes34.r2.data, varSet.vecs.facs)
+      }
+      # create the base plot with sample points on ordination
+      envfit.plot <- ggplot(
+        data = varSet.ordData,
+        aes_string(x = axes.names[1], y = axes.names[2])
+      ) +
+        geom_point(shape = 1, size = inner.pt.sz) +
+        scale_color_manual(values = unname(c(cb.pal[c("red", "green")]))) +
+        labs(
+          title = mgsub(varIDs$varID, varIDs$name, varID) # ,
+          # x=paste(axes.names[1], " [", var.exp[axes[1]], "%]", sep=""),
+          # y=paste(axes.names[2], " [", var.exp[axes[2]], "%]", sep="")
+        ) +
+        theme(
+          legend.position = "none",
+          plot.title = element_text(size = 10),
+          axis.title = element_blank()
+        )
+      # add vectors, scaled appropriately (taken from experimenting with default 
+      # `plot(envfit)`), if applicable
+      if (nrow(varSet.vectors) > 0) {
+        if (ordiArrowMul(varSet.envfit) < 1) {
+          varSet.vectors$scale1 <- varSet.vectors[, axes.names[1]] *
+            sqrt(varSet.vectors$r2) *
+            ordiArrowMul(varSet.envfit)
+          varSet.vectors$scale2 <- varSet.vectors[, axes.names[2]] *
+            sqrt(varSet.vectors$r2) *
+            ordiArrowMul(varSet.envfit)
+        } else {
+          varSet.vectors$scale1 <- varSet.vectors[, axes.names[1]] *
+            sqrt(varSet.vectors$r2) /
+            ordiArrowMul(varSet.envfit)
+          varSet.vectors$scale2 <- varSet.vectors[, axes.names[2]] *
+            sqrt(varSet.vectors$r2) /
+            ordiArrowMul(varSet.envfit)
+        }
+        envfit.plot <- envfit.plot +
+          geom_segment(
+            data = varSet.vectors,
+            x = 0,
+            y = 0,
+            aes(
+              xend = scale1,
+              yend = scale2
+            ), # /12
+            arrow = arrow(length = unit(0.02, "npc")),
+            size = 0.5,
+            color = "blue"
+          ) +
+          geom_text_repel(
+            data = varSet.vectors,
+            aes(
+              x = scale1,
+              y = scale2, # /12
+              label = name,
+              color = ifelse(p < 0.05, "sig.", "non-sig.")
+            ),
+            size = lab.size
+          )
+      }
+      # add factor centroids, if applicable
+      if (nrow(varSet.factors) > 0) {
+        centroids <- as.data.frame(varSet.envfit$factors$centroids)
+        centroids$var <- substr(row.names(centroids), 1, nchar(row.names(centroids)) - 1)
+        centroids$centroid.lab <- mgsub(
+          vars.legend$var.name,
+          vars.legend$description,
+          row.names(centroids)
+        )
+        centroid.dat <- merge(
+          centroids, 
+          varSet.factors, 
+          by.x = "var", 
+          by.y = 0, 
+          all.x = TRUE
+        )
+        centroid.dat$sig <- ifelse(centroid.dat$p < 0.05, "sig.", "non-sig.")
+        envfit.plot <- envfit.plot +
+          geom_point(
+            data = centroid.dat,
+            aes_string(
+              x = axes.names[1],
+              y = axes.names[2]
+            ),
+            shape = 3,
+            size = inner.pt.sz,
+            color = "blue"
+          ) +
+          geom_text_repel(
+            data = centroid.dat,
+            aes_string(
+              x = axes.names[1],
+              y = axes.names[2],
+              label = "centroid.lab",
+              color = "sig"
+            ),
+            size = lab.size
+          )
+      }
+      # add plot to appropriate list
+      if (type == "kos") {
+        if (first.axis == 1) {
+          varSet.kos.12.plots[[varID]] <- envfit.plot
+        } else {
+          varSet.kos.34.plots[[varID]] <- envfit.plot
+        }
+      } else {
+        if (first.axis == 1) {
+          varSet.tax.12.plots[[varID]] <- envfit.plot
+        } else {
+          varSet.tax.34.plots[[varID]] <- envfit.plot
+        }
+      }
+    }
+  }
+}
+axis.pc.var <- unique(axis.pc.var) # deduplicate
+
+#### Save Everything ####
+saveRDS(varSet.kos.12.plots, file = file.path(saveDir, "list_envfitPlots_varSets_kos_axes12.rds"))
+saveRDS(varSet.tax.12.plots, file = file.path(saveDir, "list_envfitPlots_varSets_tax_axes12.rds"))
+saveRDS(varSet.kos.34.plots, file = file.path(saveDir, "list_envfitPlots_varSets_kos_axes34.rds"))
+saveRDS(varSet.tax.34.plots, file = file.path(saveDir, "list_envfitPlots_varSets_tax_axes34.rds"))
+saveRDS(axis.pc.var, file = file.path(saveDir, "df_envfit_axis_pc_var.rds"))
+
+saveRDS(axes12.r2.data, file = file.path(saveDir, "df_envfit_axes12_r2_data.rds"))
+saveRDS(axes34.r2.data, file = file.path(saveDir, "df_envfit_axes34_r2_data.rds"))
+
+#### Check it out ####
+axes12.r2.data <- readRDS(file.path(saveDir, "df_envfit_axes12_r2_data.rds"))
+axes34.r2.data <- readRDS(file.path(saveDir, "df_envfit_axes34_r2_data.rds"))
+r2.data <- rbind(axes12.r2.data, axes34.r2.data)
+sig.r2.data <- subset(r2.data, p < 0.05) %>% droplevels()
+sig.r2.data <- sig.r2.data[order(sig.r2.data$r2, decreasing = T), ]
+kos.sig.vars <- lapply(varIDs$varID, function(var.cat) {
+  subset(sig.r2.data, t == "kos" & grepl(var.cat, var))$var %>% unique()
+})
+names(kos.sig.vars) <- varIDs$varID
+tax.sig.vars <- lapply(varIDs$varID, function(var.cat) {
+  subset(sig.r2.data, t == "tax" & grepl(var.cat, var))$var %>% unique()
+})
+names(tax.sig.vars) <- varIDs$varID
+analysis.terms <- list("kos" = kos.sig.vars, "tax" = tax.sig.vars)
+# this is the list of covariate that will be used in all subsequent analyses
+saveRDS(analysis.terms, file = file.path(saveDir, "list_analysis_terms_envfit.rds"))
+```
+
+```{r envfit-all-sig-vars}
+all.terms <- readRDS(file.path(saveDir, "list_analysis_terms_envfit.rds"))
+cat("Significant terms based on functional composition", sep = "\n")
+(kos.terms <- lapply(
+  all.terms$kos, 
+  function(x) mgsub(vars.legend$var.name, vars.legend$description, x)
+  ))
+cat("Significant terms based on taxonomic composition", sep = "\n")
+(tax.terms <- lapply(
+  all.terms$tax, 
+  function(x) mgsub(vars.legend$var.name, vars.legend$description, x)
+  ))
+
+```
+
+#### Taxonomic Diversity
+
+```{r envfit-tax, fig.height=pnas.max.ht, fig.height=20}
+# show `envfit` results for taxonomic-based diversity
+varSet.tax.12.plots <- readRDS(
+  file = file.path(saveDir, "list_envfitPlots_varSets_tax_axes12.rds")
+)
+varSet.tax.34.plots <- readRDS(
+  file = file.path(saveDir, "list_envfitPlots_varSets_tax_axes34.rds")
+)
+axis.pc.var <- readRDS(file.path(saveDir, "df_envfit_axis_pc_var.rds")) %>% as.data.table()
+pc1 <- axis.pc.var[type == "tax" & first.axis == 1, axis1] %>% sprintf("%.1f", .)
+pc2 <- axis.pc.var[type == "tax" & first.axis == 1, axis2] %>% sprintf("%.1f", .)
+varSet.tax.12.grob <- arrangeGrob(
+  grobs = varSet.tax.12.plots,
+  ncol = 1,
+  top = "PCoA Axes 1 and 2",
+  bottom = paste("Axis.1 [", pc1, "%]", sep = ""),
+  left = paste("Axis.2 [", pc2, "%]", sep = "")
+)
+pc3 <- axis.pc.var[type == "tax" & first.axis == 3, axis1] %>% sprintf("%.1f", .)
+pc4 <- axis.pc.var[type == "tax" & first.axis == 3, axis2] %>% sprintf("%.1f", .)
+varSet.tax.34.grob <- arrangeGrob(
+  grobs = varSet.tax.34.plots,
+  ncol = 1,
+  top = "PCoA Axes 3 and 4",
+  bottom = paste("Axis.3 [", pc3, "%]", sep = ""),
+  left = paste("Axis.4 [", pc4, "%]", sep = "")
+)
+varSet.tax.grob <- arrangeGrob(varSet.tax.12.grob, varSet.tax.34.grob, nrow = 1)
+grid.arrange(varSet.tax.grob)
+```
+
+#### Functional Diversity
+
+```{r envfit-kos, fig.height=pnas.max.ht, fig.height=20}
+# show `envfit` results for functional-based diversity
+varSet.kos.12.plots <- readRDS(
+  file = file.path(saveDir, "list_envfitPlots_varSets_kos_axes12.rds")
+)
+varSet.kos.34.plots <- readRDS(
+  file = file.path(saveDir, "list_envfitPlots_varSets_kos_axes34.rds")
+)
+axis.pc.var <- readRDS(file.path(saveDir, "df_envfit_axis_pc_var.rds")) %>% as.data.table()
+pc1 <- axis.pc.var[type == "kos" & first.axis == 1, axis1] %>% sprintf("%.1f", .)
+pc2 <- axis.pc.var[type == "kos" & first.axis == 1, axis2] %>% sprintf("%.1f", .)
+varSet.kos.12.grob <- arrangeGrob(
+  grobs = varSet.kos.12.plots,
+  ncol = 1,
+  top = "PCoA Axes 1 and 2",
+  bottom = paste("Axis.1 [", pc1, "%]", sep = ""),
+  left = paste("Axis.2 [", pc2, "%]", sep = "")
+)
+pc3 <- axis.pc.var[type == "kos" & first.axis == 3, axis1] %>% sprintf("%.1f", .)
+pc4 <- axis.pc.var[type == "kos" & first.axis == 3, axis2] %>% sprintf("%.1f", .)
+varSet.kos.34.grob <- arrangeGrob(
+  grobs = varSet.kos.34.plots,
+  ncol = 1,
+  top = "PCoA Axes 3 and 4",
+  bottom = paste("Axis.3 [", pc3, "%]", sep = ""),
+  left = paste("Axis.4 [", pc4, "%]", sep = "")
+)
+varSet.kos.grob <- arrangeGrob(varSet.kos.12.grob, varSet.kos.34.grob, nrow = 1)
+grid.arrange(varSet.kos.grob)
+```
+
+## 4. Constrained coorespondence analysis
+
+For the following analyses, we used a constrained coorespondence analysis (CCA) followed by PERMANOVA to test our hypotheses regarding the relationship between the selected covariates and the microbiome. We used CCA because it allows us to account for the variance explained by Demographic and Gut-related covariates (which we know from previous research may have an important effect, but we don't want to focus on here), and then test the relationships of our selected covariates and the remaining variance.
+
+###  ESA by Parenting
+
+
+Here, we generated an original model with the form: `distance matrix ~ (esa_var1 + esa_var2 + ...) * (parent_var1 + parent_var2 + ...)` and then ran `ordistep` on this model to select for the best main effects and interaction terms.
+
+```{r cca-esaByPar-analysis, cache=FALSE, eval=TRUE}
+set.seed(main.seed)
+redo.ordistep <- FALSE
+# name of file containing list of `envfit`-selected covariates
+terms.file <- file.path(saveDir, "list_analysis_terms_envfit.rds")
+type <- "kos"
+for (type in c("tax", "kos")) {
+  # name file that will be used for writing the `ordistep` results
+  ordistep.file <- file.path(saveDir, paste("ordistep_ESAbyPar_", type, ".rds", sep = ""))
+  # load all selected covariates
+  analysis.terms <- readRDS(terms.file)[[type]]
+  # a list of the selected ESA covariate(s)
+  focal.vars <- analysis.terms[["esa_"]]
+  # a list of the selected parenting covariate(s)
+  mod.vars <- analysis.terms[["parent_"]]
+  # a list of the selected demography and gut-history covariate(s)
+  cond.vars <- c(
+    analysis.terms[["demo_"]], 
+    analysis.terms[["gut_"]], 
+    analysis.terms[["Diet_"]]
+  )
+  cond.vars <- cond.vars[!is.na(cond.vars)] # make sure no NAs
+  
+  # assign correct phyloseq object to `phy.obj`
+  phy.obj <- eval(parse(text = paste("stool1", type, "phy", sep = ".")))
+  # extract KO/taxa community table and metadata table from `phy.obj`
+  comm.tbl <- otu_table(phy.obj)
+  metadata <- as(sample_data(phy.obj), "data.frame")
+  # remove samples with NAs in covars (or CCA will fail)
+  var.data <- na.omit(metadata[, c(focal.vars, mod.vars, cond.vars), drop = F])
+  # also drop those samples from community table
+  var.comm <- comm.tbl[row.names(var.data), ]
+  
+  # if there is only one focal covar and one moderating var, run CCA analysis with conditions
+  # and no model selection
+  if (length(focal.vars) == 1 & length(mod.vars) == 1) {
+    frm <- paste("var.comm ~", focal.vars, "*", mod.vars)
+    if (length(cond.vars) > 0) {
+      frm <- paste(frm, " + Condition(",
+                   paste(cond.vars, collapse = " + "), ")",
+                   sep = ""
+      )
+    }
+    cca.obj <- cca(as.formula(frm), data = var.data)
+  } else {
+    # if there are multiple focal/moderatings covars, run model selection (without conditions)
+    # using `ordistep`
+    if (redo.ordistep) {
+      # create appropriate formula for a running `cca`:
+      # `var.comm ~ focal.var.1 + focal.var2 + ... + focal.var.N +
+      #             mod.var.1 + mod.var.2 + ... + mod.var.N`
+      frm0 <- paste("var.comm ~ (",
+                    paste(focal.vars, collapse = " + "),
+                    ") * (",
+                    paste(mod.vars, collapse = " + "),
+                    ")",
+                    sep = ""
+      )
+      
+      # create full CCA model
+      cca.obj0 <- cca(as.formula(frm0), data = var.data)
+      # run model selection to possibly reduce variables
+      # set.seed(main.seed)
+      cca.ordi <- ordistep(cca.obj0, direction = "backward", trace = TRUE)
+      saveRDS(cca.ordi, file = ordistep.file)
+    } else {
+      cca.ordi <- readRDS(ordistep.file)
+    }
+    # create new formula with covars selected by `ordistep` and
+    # now include condition covars (demography and gut-history) in formula
+    frm <- paste(
+      "var.comm ~",
+      as.character(cca.ordi$call$formula)[3]
+    )
+    if (length(cond.vars) > 0) {
+      frm <- paste(frm, " + Condition(",
+                   paste(cond.vars, collapse = " + "), ")",
+                   sep = ""
+      )
+    }
+    # run CCA analysis (this one will be used for assessing significance)
+    cca.obj <- cca(as.formula(frm), data = var.data)
+  }
+  saveRDS(
+    cca.obj, 
+    file = file.path(saveDir, paste("cca_ESAbyPar_", type, ".rds", sep = ""))
+  )
+  # run PERMANOVA on CCA object to assess signficance
+  cca.aov.term <- anova(cca.obj, by = "terms", permutations = 9999, parallel = nproc)
+  print(cca.aov.term) # print PERMANOVA results and save them below
+  saveRDS(
+    cca.aov.term,
+    file = file.path(saveDir, paste("anova_cca", type, "ESAByPar_term.rds", sep = "_"))
+  )
+}
+```
+
+```{r cca-esaByPar-aovs, results='asis'}
+# create nice tables for looking as PERMANOVA results
+tax.aov.full <- readRDS(file.path(saveDir, "anova_cca_tax_ESAbyPar_term.rds"))
+tax.aov <-  as.data.frame(tax.aov.full)
+kos.aov.full <- readRDS(file.path(saveDir, "anova_cca_kos_ESAbyPar_term.rds"))
+kos.aov <- as.data.frame(kos.aov.full)
+row.names(tax.aov) <- mgsub(vars.legend$var.name, vars.legend$description, row.names(tax.aov))
+tax.aov[, "sig"] <- ifelse(tax.aov$`Pr(>F)` < 0.05 & !is.na(tax.aov$`Pr(>F)`), "*", "")
+tax.aov <- tibble::rownames_to_column(tax.aov, var = "covar")
+cat(attributes(tax.aov.full)$heading[2], sep = "\n")
+(tax.html <- tax.aov %>%
+    kable(align = c(rep("r", ncol(tax.aov) - 1), "l"), digits = 3, caption = "Taxonomic diversity") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+    column_spec(1, border_right = T))
+
+row.names(kos.aov) <- mgsub(vars.legend$var.name, vars.legend$description, row.names(kos.aov))
+kos.aov[, "sig"] <- ifelse(kos.aov$`Pr(>F)` < 0.05 & !is.na(kos.aov$`Pr(>F)`), "*", "")
+cat(attributes(kos.aov.full)$heading[2], sep = "\n")
+(kos.html <- kos.aov %>%
+    tibble::rownames_to_column(var = "covar") %>%
+    kable(align = c(rep("r", 5), "l"), digits = 3, caption = "Functional diversity") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+    column_spec(1, border_right = T))
+```
+
+```{r cca-esaByPar-cap, eval=TRUE}
+esaByPar.cap <- "Constrained coorespondance analysis (CCA) ordinations of taxonomic (A & B) and functional diversity (C & D). Each point represents a single fecal sample. (A) Significant association between taxonomic diversity and the ESA covariate, LEC Turmoil. Points are colored by individual LEC Turmoil scores with purple indicating low and green indicating high. (B) Significant interaction between Income to Needs, Parent-Child Dysfunction and taxonomic diversity of the microbiome. The color of the outer ring of each point indicates the individual Income to Needs score of the child, where blue indicates low and red indicates high, and the inner circle of each point is colored according to the parent-reported Parent-Child Dysfunction score, where white indicates low dysfunction and black indicate high dysfunction. (C) Significant interaction between LEC Turmoil, Parent-Child Dysfunction, and functional diversity of the microbiome. The outer ring of each point is colored by the individual LEC Turmoil scores as in panel A, and the inner circle is colored by the Parent-Child Dysfunction score as in panel B. (D) Significant interaction between Income to Needs, Parent-Child Dysfunction, and functional diversity of the microbiome. Points are colored in an identical manner to panel B."
+```
+
+```{r cca-esaByPar-fig-gen, fig.height=pnas.max.ht/2}
+# create ordination figures for ESA CCA results showing only significant covars
+
+# assign correct phyloseq objects to new variable names
+tax.obj <- stool1.tax.phy
+kos.obj <- stool1.kos.phy
+# read in saved CCA results
+(tax.cca <- readRDS(file.path(saveDir, "cca_ESAbyPar_tax.rds")))
+(kos.cca <- readRDS(file.path(saveDir, "cca_ESAbyPar_kos.rds")))
+# read in saved PERMANOVA results
+tax.aov <- readRDS(file.path(saveDir, "anova_cca_tax_ESAbyPar_term.rds"))
+kos.aov <- readRDS(file.path(saveDir, "anova_cca_kos_ESAbyPar_term.rds"))
+
+# extract significant ESA covars from taxonomic diversity PERMANOVA table
+tax.aov <- tax.aov[complete.cases(tax.aov), ]
+tax.sig.labs <- row.names(tax.aov[tax.aov$`Pr(>F)` <= 0.05, ])
+if (any(grepl(":", tax.sig.labs))) {
+  split.labs <- strsplit(tax.sig.labs[grepl(":", tax.sig.labs)], ":") %>% unlist()
+  tax.sig.vars <- unique(c(split.labs, tax.sig.labs))
+} else {
+  tax.sig.vars <- tax.sig.labs
+}
+# extract significant ESA covars from functional diversity PERMANOVA table
+kos.aov <- kos.aov[complete.cases(kos.aov), ]
+kos.sig.labs <- row.names(kos.aov[kos.aov$`Pr(>F)` <= 0.05, ])
+if (any(grepl(":", kos.sig.labs))) {
+  split.labs <- strsplit(kos.sig.labs[grepl(":", kos.sig.labs)], ":") %>% unlist()
+  kos.sig.vars <- unique(c(split.labs, kos.sig.labs))
+} else {
+  kos.sig.vars <- kos.sig.labs
+}
+
+# create plots
+metadata <- as(sample_data(kos.obj), "data.frame")
+plot.axes <- c(1, 2)
+tax.sites <- as.data.frame(tax.cca$CCA$u[, plot.axes]) # sample points
+tax.axes <- names(tax.sites)[plot.axes]
+tax.sites$smpl <- sub("_R1", "", row.names(tax.sites)) # cleanup sample names
+tax.sites <- merge(tax.sites, metadata, by = "smpl", all.x = T)
+# extract vector data for significant covariates
+tax.spec <- as.data.frame(tax.cca$CCA$v)
+tax.spec[, "kos"] <- row.names(tax.spec)
+tax.scale <- ordiArrowMul(tax.cca$CCA$u[, plot.axes])
+tax.arws <- as.data.frame(tax.cca$CCA$biplot[, plot.axes] / tax.scale)
+tax.arws <- tax.arws[tax.sig.vars, ]
+tax.arws$var <- mgsub(
+  vars.legend$var.name,
+  vars.legend$description,
+  row.names(tax.arws)
+)
+
+# LEC Turmoil plot
+lec.tur.tax0 <- ggplot(data = tax.sites, aes_string(tax.axes[1], tax.axes[2])) +
+  geom_segment(
+    data = tax.arws, x = 0, y = 0,
+    aes_string(
+      xend = tax.axes[1],
+      yend = tax.axes[2]
+    ),
+    arrow = arrow(length = unit(0.02, "npc")),
+    color = "royalblue4", size = seg.size
+  ) +
+  geom_point(
+    aes_string(color = row.names(tax.arws)[1]),
+    shape = 19, size = outer.pt.sz
+  ) +
+  geom_point(
+    aes_string(fill = row.names(tax.arws)[2]),
+    shape = 21, size = inner.pt.sz, color = "white"
+  ) +
+  geom_text_repel(
+    data = tax.arws,
+    aes_string(
+      x = tax.axes[1],
+      y = tax.axes[2],
+      label = "var"
+    ),
+    size = lab.size,
+    color = "royalblue4"
+  ) +
+  scale_color_gradientn(
+    name = vars.legend[var.name == row.names(tax.arws)[1]]$description, 
+    colors = blue_to_red
+  ) +
+  scale_fill_gradient(
+    name = gsub(" ", "\n", vars.legend[var.name == row.names(tax.arws)[2]]$description),
+    low = "white", 
+    high = "black"
+  ) +
+  labs(title = "A", subtitle = "Taxonomic diversity") +
+  theme(legend.position = "bottom")
+leg1 <- get_legend(lec.tur.tax0)
+lec.tur.tax <- lec.tur.tax0 + theme(legend.position = 'none')
+
+kos.sites <- as.data.frame(kos.cca$CCA$u[, plot.axes]) # sample points
+kos.axes <- names(kos.sites)[plot.axes]
+kos.sites$smpl <- sub("_R1", "", row.names(kos.sites)) # cleanup sample names
+kos.sites <- merge(kos.sites, metadata, by = "smpl", all.x = T)
+# extract vector data for significant covariates
+kos.spec <- as.data.frame(kos.cca$CCA$v)
+kos.spec[, "kos"] <- row.names(kos.spec)
+kos.scale <- ordiArrowMul(kos.cca$CCA$u[, plot.axes])
+kos.arws <- as.data.frame(kos.cca$CCA$biplot[, plot.axes] / kos.scale)
+kos.arws <- kos.arws[kos.sig.vars, ]
+kos.arws$var <- mgsub(
+  vars.legend$var.name,
+  vars.legend$description,
+  row.names(kos.arws)
+)
+# LEC Turmoil by Parent-Child Dysfunction plot
+tur.pcd.kos0 <- ggplot(data = kos.sites, aes_string(kos.axes[1], kos.axes[2])) +
+  geom_segment(
+    data = kos.arws, 
+    x = 0, 
+    y = 0,
+    aes_string(
+      xend = kos.axes[1],
+      yend = kos.axes[2]
+    ),
+    arrow = arrow(length = unit(0.02, "npc")),
+    color = "royalblue4", size = seg.size
+  ) +
+  geom_point(
+    aes_string(color = row.names(kos.arws)[1]),
+    shape = 19, size = outer.pt.sz
+  ) +
+  geom_point(
+    aes_string(fill = row.names(kos.arws)[2]),
+    shape = 21, size = inner.pt.sz, color = "white"
+  ) +
+  geom_text_repel(
+    data = kos.arws,
+    aes_string(
+      x = kos.axes[1],
+      y = kos.axes[2],
+      label = "var"
+    ),
+    size = lab.size,
+    color = "royalblue4"
+  ) +
+  scale_color_gradientn(name = kos.arws$var[1], colors = purple_to_green) +
+  scale_fill_gradient(
+    name = sub("Child ", "Child\n", kos.arws$var[2]), 
+    low = "white", 
+    high = "black"
+  ) +
+  labs(title = "B", subtitle = "Functional diversity") +
+  guides(fill = "none") +
+  theme(
+    axis.title.y = element_blank(),
+    legend.position = "bottom"
+  )
+leg2 <- get_legend(tur.pcd.kos0)
+tur.pcd.kos <- tur.pcd.kos0 + theme(legend.position = "none")
+
+# create panelled figure
+plots.grob <- plot_grid(lec.tur.tax, tur.pcd.kos, nrow = 1)
+wds <- c(0.20, 0.25, 0.18, 0.20, 0.17)
+sum(wds)
+legs.grob <- plot_grid(
+  NULL, leg1, NULL, leg2, NULL, 
+  rel_widths = wds,
+  nrow = 1
+)
+figure <- plot_grid(plots.grob, legs.grob, ncol = 1, rel_heights = c(0.9, 0.1))
+print(figure)
+```
+
+### Child Behavior by Parenting
+
+```{r cca-chbByParent-analysis, cache=FALSE, eval=TRUE}
+set.seed(main.seed)
+redo.ordistep <- FALSE
+terms.file <- file.path(saveDir, "list_analysis_terms_envfit.rds")
+for (type in c("tax")) {
+  ordistep.file <- file.path(saveDir, paste("ordistep_chbByPar_", type, ".rds", sep = ""))
+  analysis.terms <- readRDS(terms.file)[[type]]
+  focal.vars <- analysis.terms[["child_behav_"]]
+  mod.vars <- analysis.terms[["parent_"]]
+  cond.vars <- c(
+    analysis.terms[["demo_"]], 
+    analysis.terms[["gut_"]], 
+    analysis.terms[["Diet_"]]
+  )
+  cond.vars <- cond.vars[!is.na(cond.vars)]
+  phy.obj <- eval(parse(text = paste("stool1", type, "phy", sep = ".")))
+  comm.tbl <- otu_table(phy.obj)
+  metadata <- as(sample_data(phy.obj), "data.frame")
+  var.data <- na.omit(metadata[, c(focal.vars, mod.vars, cond.vars), drop = F])
+  var.comm <- comm.tbl[row.names(var.data), ]
+  if (length(focal.vars) == 1 & length(mod.vars) == 1) {
+    frm <- paste("var.comm ~", focal.vars, "*", mod.vars)
+    if (length(cond.vars) > 0) {
+      frm <- paste(frm, " + Condition(",
+                   paste(cond.vars, collapse = " + "), ")",
+                   sep = ""
+      )
+    }
+    cca.obj <- cca(as.formula(frm), data = var.data)
+  } else {
+    if (redo.ordistep) {
+      frm0 <- paste("var.comm ~ (",
+                    paste(focal.vars, collapse = " + "),
+                    ") * (",
+                    paste(mod.vars, collapse = " + "),
+                    ")",
+                    sep = ""
+      )
+      print(frm0)
+      cca.obj0 <- cca(as.formula(frm0), data = var.data)
+      cca.ordi <- ordistep(cca.obj0, direction = "backward", trace = TRUE)
+      saveRDS(cca.ordi, file = ordistep.file)
+    } else {
+      cca.ordi <- readRDS(ordistep.file)
+    }
+    frm <- paste(
+      "var.comm ~",
+      as.character(cca.ordi$call$formula)[3]
+    )
+    if (length(cond.vars) > 0) {
+      frm <- paste(frm, " + Condition(",
+                   paste(cond.vars, collapse = " + "), ")",
+                   sep = ""
+      )
+    }
+    cca.obj <- cca(as.formula(frm), data = var.data)
+  }
+  saveRDS(
+    cca.obj, 
+    file = file.path(saveDir, paste("cca_chbByPar_", type, ".rds", sep = ""))
+  )
+  # cca.aov.marg <- anova(cca.obj, by="margin", permutations=999, parallel=nproc)
+  cca.aov.term <- anova(cca.obj, by = "terms", permutations = 9999, parallel = nproc)
+  # saveRDS(cca.aov.marg, file=file.path(saveDir, paste("anova_cca", type, "chbByPar_marg.rds", sep="_")))
+  saveRDS(
+    cca.aov.term,
+    file = file.path(saveDir, paste("anova_cca", type, "chbByPar_term.rds", sep = "_"))
+  )
+}
+```
+
+```{r cca-chbByPar-aovs, results='asis'}
+tax.aov.full <- readRDS(file.path(saveDir, "anova_cca_tax_chbByPar_term.rds"))
+tax.aov <-  as.data.frame(tax.aov.full)
+kos.aov.full <- readRDS(file.path(saveDir, "anova_cca_kos_chbByPar_term.rds"))
+kos.aov <- as.data.frame(kos.aov.full)
+row.names(tax.aov) <- mgsub(vars.legend$var.name, vars.legend$description, row.names(tax.aov))
+tax.aov[, "sig"] <- ifelse(tax.aov$`Pr(>F)` < 0.05 & !is.na(tax.aov$`Pr(>F)`), "*", "")
+tax.aov <- rownames_to_column(tax.aov, var = "covar")
+cat(attributes(tax.aov.full)$heading[2], sep = "\n")
+(tax.html <- tax.aov %>%
+    kable(align = c(rep("r", ncol(tax.aov) - 1), "l"), digits = 3, caption = "Taxonomic diversity") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+    column_spec(1, border_right = T))
+
+row.names(kos.aov) <- mgsub(vars.legend$var.name, vars.legend$description, row.names(kos.aov))
+kos.aov[, "sig"] <- ifelse(kos.aov$`Pr(>F)` < 0.05 & !is.na(kos.aov$`Pr(>F)`), "*", "")
+cat(attributes(kos.aov.full)$heading[2], sep = "\n")
+(kos.html <- kos.aov %>%
+    rownames_to_column(var = "covar") %>%
+    kable(align = c(rep("r", 5), "l"), digits = 3, caption = "Functional diversity") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+    column_spec(1, border_right = T))
+```
+
+```{r cca-chbByPar-cap, eval=FALSE}
+chbByPar.cap <- "Constrained coorespondance analysis (CCA) ordinations of taxonomic (A) and functional diversity (B & C). Each point represents a single fecal sample. (A) Significant association between taxonomic diversity and the Child Behavior covariate, Depressive Problems. Points are colored by individual Depressive Problems scores with blue indicating low and red indicating high. (B) Significant interaction between Inhibitory Control, Parent-Child Dysfunction and functional diversity of the microbiome. The color of the outer ring of each point indicates the individual Inhibitory Control score of the child, where purple indicates low and red indicates high, and the inner circle of each point is colored according to the parent-reported Parent-Child Dysfunction score, where white indicates low dysfunction and black indicate high dysfunction. (C) Significant interaction between Depressive Problems, Parent-Child Dysfunction, and functional diversity of the microbiome. The outer ring of each point is colored by the individual Depressive Problems scores as in panel A, and the inner circle is colored by the Parent-Child Dysfunction score as in panel B."
+```
+
+```{r cca-chbByPar-fig-gen, fig.height=pnas.max.ht/1.5, fig.cap=chbByPar.cap, eval=FALSE}
+tax.obj <- stool1.tax.phy
+kos.obj <- stool1.kos.phy
+(tax.cca <- readRDS(file.path(saveDir, "cca_chbByPar_tax.rds")))
+(kos.cca <- readRDS(file.path(saveDir, "cca_chbByPar_kos.rds")))
+tax.aov <- readRDS(file.path(saveDir, "anova_cca_tax_chbByPar_term.rds"))
+kos.aov <- readRDS(file.path(saveDir, "anova_cca_kos_chbByPar_term.rds"))
+
+tax.aov <- tax.aov[complete.cases(tax.aov), ]
+tax.sig.labs <- row.names(tax.aov[tax.aov$`Pr(>F)` <= 0.05, ])
+if (any(grepl(":", tax.sig.labs))) {
+  split.labs <- strsplit(tax.sig.labs[grepl(":", tax.sig.labs)], ":") %>% unlist()
+  tax.sig.vars <- unique(c(split.labs, tax.sig.labs))
+} else {
+  tax.sig.vars <- tax.sig.labs
+}
+kos.aov <- kos.aov[complete.cases(kos.aov), ]
+kos.sig.labs <- row.names(kos.aov[kos.aov$`Pr(>F)` <= 0.05, ])
+if (any(grepl(":", kos.sig.labs))) {
+  split.labs <- strsplit(kos.sig.labs[grepl(":", kos.sig.labs)], ":") %>% unlist()
+  kos.sig.vars <- unique(c(split.labs, kos.sig.labs))
+} else {
+  kos.sig.vars <- kos.sig.labs
+}
+
+metadata <- as(sample_data(kos.obj), "data.frame")
+plot.axes <- c(1, 2)
+kos.sites <- as.data.frame(kos.cca$CCA$u[, plot.axes])
+kos.axes <- names(kos.sites)[plot.axes]
+kos.sites$smpl <- sub("_R1", "", row.names(kos.sites))
+kos.sites <- merge(kos.sites, metadata, by = "smpl", all.x = T)
+kos.spec <- as.data.frame(kos.cca$CCA$v)
+kos.spec[, "kos"] <- row.names(kos.spec)
+kos.scale <- ordiArrowMul(kos.cca$CCA$u[, plot.axes])
+kos.arws <- as.data.frame(kos.cca$CCA$biplot[, plot.axes] / kos.scale)
+kos.arws <- kos.arws[kos.sig.vars, ]
+kos.arws$var <- mgsub(
+  vars.legend$var.name,
+  vars.legend$description,
+  row.names(kos.arws)
+)
+
+imp.kos.arws <- kos.arws[4, ]
+imp.kos0 <- ggplot(data = kos.sites, aes_string(kos.axes[1], kos.axes[2])) +
+  geom_segment(
+    data = imp.kos.arws, x = 0, y = 0,
+    aes_string(
+      xend = kos.axes[1],
+      yend = kos.axes[2]
+    ),
+    arrow = arrow(length = unit(0.02, "npc")),
+    color = "royalblue4", size = seg.size
+  ) +
+  geom_point(
+    aes_string(color = row.names(imp.kos.arws)[1]),
+    shape = 19, size = outer.pt.sz
+  ) +
+  geom_text_repel(
+    data = imp.kos.arws,
+    aes_string(
+      x = kos.axes[1],
+      y = kos.axes[2],
+      label = "var"
+    ),
+    size = lab.size,
+    color = "royalblue4"
+  ) +
+  scale_color_viridis_c(name = gsub(" ", "\n", imp.kos.arws$var)) +
+  labs(title = "A", subtitle = "Functional diversity") +
+  theme(legend.position = "bottom", legend.box.just = 1)
+leg1 <- get_legend(imp.kos0)
+imp.kos <- imp.kos0 + theme(legend.position = "none")
+
+ic.pcd.kos.arws <- kos.arws[c(1, 2, 5), ]
+ic.pcd.kos0 <- ggplot(data = kos.sites, aes_string(kos.axes[1], kos.axes[2])) +
+  geom_segment(
+    data = ic.pcd.kos.arws, x = 0, y = 0,
+    aes_string(
+      xend = kos.axes[1],
+      yend = kos.axes[2]
+    ),
+    arrow = arrow(length = unit(0.02, "npc")),
+    color = "royalblue4", size = seg.size
+  ) +
+  geom_point(
+    aes_string(color = row.names(ic.pcd.kos.arws)[1]),
+    shape = 19, size = outer.pt.sz
+  ) +
+  geom_point(
+    aes_string(fill = row.names(ic.pcd.kos.arws)[2]),
+    shape = 21, size = inner.pt.sz, color = "white"
+  ) +
+  geom_text_repel(
+    data = ic.pcd.kos.arws,
+    aes_string(
+      x = kos.axes[1],
+      y = kos.axes[2],
+      label = "var"
+    ),
+    size = lab.size,
+    color = "royalblue4"
+  ) +
+  scale_color_gradientn(
+    name = gsub(" ", "\n", ic.pcd.kos.arws$var[1]), 
+    colors = blue_to_red
+    ) +
+  scale_fill_gradient(
+    name = gsub(" ", "\n", ic.pcd.kos.arws$var[2]), 
+    low = "white", 
+    high = "black"
+    ) +
+  labs(title = "B", subtitle = "Functional diversity") +
+  theme(legend.position = "bottom", axis.title.y = element_blank(), legend.box.just = 1)
+leg2.1 <- get_legend(ic.pcd.kos0)
+leg2.2 <- get_legend(ic.pcd.kos0 + theme(legend.box = "vertical", legend.box.just = 1))
+ic.pcd.kos <- ic.pcd.kos0 + theme(legend.position = "none")
+
+dep.pcd.kos.arws <- kos.arws[c(3, 2, 6), ]
+dep.pcd.kos0 <- ggplot(data = kos.sites, aes_string(kos.axes[1], kos.axes[2])) +
+  geom_segment(
+    data = dep.pcd.kos.arws, x = 0, y = 0,
+    aes_string(
+      xend = kos.axes[1],
+      yend = kos.axes[2]
+    ),
+    arrow = arrow(length = unit(0.02, "npc")),
+    color = "royalblue4", size = seg.size
+  ) +
+  geom_point(
+    aes_string(color = row.names(dep.pcd.kos.arws)[1]),
+    shape = 19, size = outer.pt.sz
+  ) +
+  geom_point(
+    aes_string(fill = row.names(dep.pcd.kos.arws)[2]),
+    shape = 21, size = inner.pt.sz, color = "white", show.legend = F
+  ) +
+  geom_text_repel(
+    data = dep.pcd.kos.arws,
+    aes_string(
+      x = kos.axes[1],
+      y = kos.axes[2],
+      label = "var"
+    ),
+    size = lab.size,
+    color = "royalblue4"
+  ) +
+  scale_color_gradientn(
+    name = gsub(" ", "\n", dep.pcd.kos.arws$var[1]), 
+    colors = purple_to_green
+    ) +
+  scale_fill_gradient(
+    name = gsub(" ", "\n", dep.pcd.kos.arws$var[2]), 
+    low = "white", 
+    high = "black"
+    ) +
+  labs(title = "C", subtitle = "Functional diversity") +
+  theme(legend.position = "bottom", axis.title.y = element_blank(), legend.box.just = 1)
+leg3 <- get_legend(dep.pcd.kos0)
+dep.pcd.kos1 <- dep.pcd.kos0 + theme(legend.position = "none")
+dep.pcd.kos2 <- dep.pcd.kos0 + 
+  theme(legend.position = "none", axis.title.y = element_text(angle = 90))
+
+plot.wds1 <- c(0.35, 0.325, 0.325)
+sum(plot.wds1)
+plot.grob1 <- plot_grid(
+  imp.kos, ic.pcd.kos, dep.pcd.kos1,
+  nrow = 1,
+  rel_widths = plot.wds1
+)
+leg.wds1 <- c(0.25, 0.50, 0.25)
+sum(leg.wds1)
+leg.grob1 <- plot_grid(leg1, leg2.1, leg3, nrow = 1, rel_widths = leg.wds1)
+
+figure1 <- plot_grid(plot.grob1, leg.grob1, ncol = 1, rel_heights = c(0.9, 0.1))
+print(figure1)
+ggsave(
+  figure1,
+  file = file.path(figDir, "mainFig_chb_par_intrxns_ccas_v1.pdf"),
+  width = pnas.2col, height = pnas.max.ht / 2
+)
+
+leg.hts2 <- c(0.25, 0.50, 0.25)
+sum(leg.hts2)
+leg.grob2 <- plot_grid(
+  NULL, leg1, NULL, leg2.2, NULL, leg3, NULL,
+  ncol = 1,
+  # rel_heights = leg.hts2,
+  axis = "trbl",
+  align = "v"
+  )
+
+figure2 <- plot_grid(
+  plot_grid(imp.kos, ic.pcd.kos, nrow = 1), 
+  plot_grid(dep.pcd.kos2, NULL, leg.grob2, nrow = 1, rel_widths = c(0.5, 0.1, 0.4)), 
+  ncol = 1
+  )
+print(figure2)
+``` 
+
+## 5. Compound Poisson Generalized Linear Models
+
+See code in Rmd. These chunks are best run on a machine with many cores and a good amount of storage.
+
+```{r cpglm-condsInModel-gen, eval=FALSE}
+# This analysis is better run on a machine with many cores to take advantage of parallelization
+{set.seed(main.seed)
+
+terms.file <- file.path(saveDir, "list_analysis_terms_envfit.rds")
+nCores <- 2 # ideally set to more, especially for kos
+type <- "tax" # "kos" "tax"
+dfsDir <- paste("CondsInModel", type, "DFs", sep = "_")
+if (!dir.exists(file.path(saveDir, dfsDir))) {
+  dir.create(file.path(saveDir, dfsDir))
+}
+# print(type, quote=F)
+phy.name <- paste("stool1", type, "phy", sep = ".")
+r2.data <- readRDS(file.path(saveDir, "df_envfit_axes12_r2_data.rds"))
+child.r2s <- subset(r2.data, grepl("^child_behav_", var) & t == type)
+child.ordered <- child.r2s$var[order(child.r2s$r2, decreasing = TRUE)]
+esa.r2s <- subset(r2.data, grepl("^esa_", var) & t == type)
+esa.ordered <- esa.r2s$var[order(esa.r2s$r2, decreasing = TRUE)]
+analysis.terms <- readRDS(terms.file)[[type]]
+vars <- c(child.ordered, esa.ordered)
+conds <- c(
+  analysis.terms[["demo_"]], 
+  analysis.terms[["gut_"]],
+  analysis.terms[["Diet_"]]
+  )
+conds <- conds[!is.na(conds)]
+
+phy.obj <- eval(parse(text = phy.name))
+pruned.phy <- prune_samples(
+  row.names(sample_data(phy.obj)[complete.cases(sample_data(phy.obj)[, vars]), ]),
+  phy.obj
+)
+pruned.phy <- prune_taxa(taxa_sums(pruned.phy) > 0, pruned.phy)
+metadata <- as(sample_data(pruned.phy)[, c(vars, conds)], "data.frame")
+comm.tbl <- as(otu_table(pruned.phy), "matrix")
+
+if (type == "tax") {
+  colnames(comm.tbl) <- gsub("|", ".", colnames(comm.tbl), fixed = T)
+}
+
+cl <- makeCluster(nCores, type = "FORK")
+registerDoParallel(cl, nCores)
+all.units <- colnames(comm.tbl)
+
+# bad.pairs <- data.frame(
+#   "var" = c(
+#     "esa_LEC_Turmoil_Combined",
+#     "esa_LEC_TOT_Combined",
+#     "child_behav_CBQ_Sadness_t1"
+#   ),
+#   "unit" = c(
+#     "k__Bacteria.p__Bacteroidetes.c__Bacteroidia.o__Bacteroidales.f__Bacteroidaceae.g__Bacteroides.s__Bacteroides_intestinalis.t__GCF_000172175",
+#     "k__Bacteria.p__Bacteroidetes.c__Bacteroidia.o__Bacteroidales.f__Bacteroidaceae.g__Bacteroides.s__Bacteroides_intestinalis.t__GCF_000172175",
+#     "k__Bacteria.p__Firmicutes.c__Bacilli.o__Lactobacillales.f__Streptococcaceae.g__Streptococcus.s__Streptococcus_australis.t__Streptococcus_australis_unclassified"
+#   )
+# )
+
+### For testing
+# var <- "esa_LEC_Turmoil_Combined"
+# unit <- "k__Bacteria.p__Bacteroidetes.c__Bacteroidia.o__Bacteroidales.f__Bacteroidaceae.g__Bacteroides.s__Bacteroides_intestinalis.t__GCF_000172175"
+# unit <- all.units[1]
+# var <- vars[1]
+
+all.pvals <- foreach(
+  unit = all.units,
+  .final = function(x) setNames(x, all.units),
+  .verbose = TRUE
+) %dopar% {
+  sapply(
+    vars,
+    function(var) {
+      model.data <- cbind(metadata[, c(var, conds), drop = F], comm.tbl[, unit, drop = F])
+      unit.frm <- paste(unit, "~", paste(c(var, conds), collapse = " + "))
+      # if (var %in% bad.pairs$var & unit %in% bad.pairs$unit) {
+      #   unit.model <- NA
+      #   class(unit.model) <- "try-error"
+      # } else {
+        unit.model <- try(
+          cpglm(
+            as.formula(unit.frm), 
+            data = model.data, 
+            link = "identity", 
+            optimizer = "L-BFGS-B"
+            ), 
+          silent = T
+          )
+      # }
+      if (class(unit.model) == "try-error") {
+        unit.pval <- NA
+        intercept <- NA
+        slope <- NA
+      } else {
+        sink(file = "tmp.txt")
+        model.sum <- summary(unit.model)
+        sink()
+        unit.pval <- model.sum$coefficients[var, "Pr(>|t|)"]
+        intercept <- unname(unit.model$coefficients[1])
+        slope <- unname(unit.model$coefficients[var])
+      }
+      ### ^ There is no r2 value for this method (AIC-based), so going to use slope instead
+      unit.df <- data.frame(
+        "unit" = unit,
+        "b" = intercept,
+        "m" = slope
+      )
+      saveRDS(
+        unit.df, 
+        file.path(saveDir, dfsDir, paste("df_", var, "-", unit, ".rds", sep = ""))
+        )
+      return(unit.pval)
+    }
+  )
+}
+stopCluster(cl)
+}
+saveRDS(
+  all.pvals,
+  file = file.path(
+    saveDir,
+    paste("list_", type, "_childSesVars_allUnits_cpglms_condsInModel_unadjPvals.rds",
+          sep = ""
+    )
+  )
+)
+```
+
+<!-- ### Taxon-Covariate Relationships -->
+
+```{r cpglm-condsInModel-tax-plots-gen, eval=FALSE}
+dfsDir <- "CondsInModel_tax_DFs"
+dfsTar <- paste(dfsDir, "tgz", sep = ".")
+varPlotDir <- file.path(saveDir, "cpglm_condsInModel_tax_plots")
+if (!dir.exists(varPlotDir)) {
+  dir.create(varPlotDir)
+}
+# unitPlotDir <- file.path(varPlotDir, "unit_plots")
+# if(!dir.exists(unitPlotDir)) {
+#     dir.create(unitPlotDir)
+# }
+tax.unadj.pvals <- readRDS(
+  file = file.path(saveDir, "list_tax_childSesVars_allUnits_cpglms_condsInModel_unadjPvals.rds")
+)
+
+# tax.unadj.pvals %>% head
+tax.unadj.pvals.df <- data.frame(tax.unadj.pvals, stringsAsFactors = F) %>%
+  as.matrix() %>%
+  melt(as.is = T)
+tax.adj.pvals <- data.frame(
+  "var" = tax.unadj.pvals.df$Var1,
+  "unit" = tax.unadj.pvals.df$Var2,
+  "adj.pval" = p.adjust(tax.unadj.pvals.df$value, method = "fdr"),
+  stringsAsFactors = F
+)
+tax.sig.pvals <- droplevels(subset(tax.adj.pvals, adj.pval < 0.05))
+if (nrow(tax.sig.pvals) == 0) {
+  print("No Taxa have a significant relationship with any co-variates")
+} else {
+  # metadata <- readRDS(file.path(saveDir, "df_allVars_condsResids.rds"))
+  metadata <- as(sample_data(stool1.tax.phy), "data.frame")
+  comm.tbl <- as(otu_table(stool1.tax.phy), "matrix")
+  comm.tbl <- comm.tbl[row.names(metadata), ]
+  colnames(comm.tbl) <- gsub("|", ".", colnames(comm.tbl), fixed = TRUE)
+  tax.sig.pvals$spearman.r <- apply(
+    tax.sig.pvals[, 1:2], 1,
+    function(row) {
+      # print(row)
+      cor(as.numeric(metadata[, as.character(row["var"])]),
+          comm.tbl[, as.character(row["unit"])],
+          method = "spearman",
+          use = "complete.obs"
+      )
+    }
+  )
+  tax.plot.list <- list()
+  unit.label.list <- list()
+  # v <- "child_behav_CBCL_extern_t1"
+  for (v in sort(unique(tax.sig.pvals$var))) {
+    print(v)
+    var.sig.pvals <- subset(tax.sig.pvals, var == v) %>% droplevels()
+    if (nrow(var.sig.pvals) == 0) {
+      NULL
+    } else {
+      var.data <- cbind(
+        metadata[, v, drop = F],
+        comm.tbl[, as.character(var.sig.pvals$unit), drop = F]
+      ) %>%
+        melt(id.var = v, variable.name = "unit", value.name = "rel.abund")
+      var.data$unit.short <- strsplit(as.character(var.data$unit), ".", fixed = T) %>%
+        sapply(tail, 2) %>%
+        apply(2, paste, collapse = "\n")
+      unit.med.relAbund <- doBy::summaryBy(rel.abund ~ unit, data = var.data, FUN = median)
+      good.units <- subset(unit.med.relAbund, rel.abund.median > 0)
+      if (nrow(good.units) == 0) {
+        NULL
+      } else {
+        var.data <- subset(var.data, unit %in% good.units$unit) %>% droplevels()
+        cor.data <- subset(var.sig.pvals, var == v & unit %in% unique(var.data$unit)) %>%
+          droplevels()
+        unit.label.list[[v]] <- data.frame(
+          "var" = v,
+          "relationship" = ifelse(cor.data$spearman.r < 0, "-",
+                                  ifelse(cor.data$spearman.r > 0, "+", "flat")
+          ),
+          "taxon" = unique(var.data$unit)
+        )
+        reg.lines <- data.frame(NULL)
+        # u <- unique(as.character(var.data$unit))[1]
+        reg.slopes <- data.frame(
+          matrix(ncol = 2, nrow = length(unique(as.character(var.data$unit))))
+        ) %>% setNames(c("unit", "reg.slope"))
+        row.names(reg.slopes) <- unique(as.character(var.data$unit))
+        for (u in unique(as.character(var.data$unit))) {
+          print(u)
+          model.data <- subset(var.data, unit == u)
+          file.vu <- paste(dfsDir, "/df_", v, "-", u, ".rds", sep = "")
+          untar(file.path(saveDir, dfsTar),
+                files = file.vu,
+                compressed = "gzip"
+          )
+          unit.df <- readRDS(file.vu)
+          file.remove(file.vu)
+          file.remove(dfsDir)
+          unit.df$unit.short <- strsplit(as.character(u), ".", fixed = T) %>%
+            sapply(tail, 2) %>%
+            apply(2, paste, collapse = "\n")
+          reg.slopes[u, c("unit", "reg.slope")] <- unit.df[1, c("unit.short", "m")]
+          reg.lines <- rbind(reg.lines, unit.df)
+        }
+        unit.label.list[[v]]$reg.slope <- reg.slopes$reg.slope
+        var.data$log.rel.abund <- log(var.data$rel.abund)
+        var.plot <- ggplot(data = var.data, aes_string(x = v, y = "log.rel.abund")) +
+          geom_abline(
+            data = reg.lines, aes(intercept = b, slope = m),
+            color = "blue", size = 0.5
+          ) +
+          geom_point(aes(shape = ifelse(rel.abund == 0, "zero", "not zero")),
+                     alpha = 0.6
+          ) +
+          scale_shape_manual(name = "Relative abundance", values = c(16, 1)) +
+          labs(
+            y = "log(Unit Relative Abundance)",
+            x = mgsub(vars.legend$var.name, vars.legend$description, v),
+            title = "Compound Poisson GLMs on variable residuals"
+          ) +
+          facet_wrap(~unit.short, scales = "free_y") +
+          theme(
+            axis.text.y = element_blank(),
+            legend.position = "top",
+            legend.title = element_text(size = 8),
+            legend.text = element_text(size = 6),
+            axis.text = element_text(size = 8),
+            axis.title = element_text(size = 10),
+            strip.text = element_text(size = 8)
+          )
+        tax.plot.list[[v]] <- var.plot
+        nCol <- ceiling(sqrt(length(unique(var.data$unit))))
+        nRow <- ceiling(length(unique(var.data$unit)) / nCol)
+        ggsave(
+          var.plot,
+          file = file.path(varPlotDir, paste(gsub(".", "_", v, fixed = T), "png", sep = ".")),
+          height = nRow * 2,
+          width = nCol * 2.5,
+          dpi = 300
+        )
+      }
+    }
+  }
+  
+  # unit.label.df <- do.call("rbind", e$unit.label.list)
+  unit.label.df <- do.call("rbind", unit.label.list)
+  row.names(unit.label.df) <- NULL
+  unit.label.df$var <- mgsub(
+    c(vars.legend$var.name, ".resid"),
+    c(vars.legend$description, " Residuals"),
+    unit.label.df$var
+  )
+  taxa.split <- strsplit(as.character(unit.label.df$taxon), ".", fixed = TRUE)
+  taxa.tbl <- sapply(taxa.split, function(i) {
+    if (length(i) < 8) {
+      i <- c(i, "t_NA")
+    }
+    i
+  }) %>%
+    t() %>%
+    as.data.frame()
+  taxa.tbl <- taxa.tbl[, -8]
+  names(taxa.tbl) <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+  names(unit.label.df) <- c("Variable", "Relationship", "lab", "Slope")
+  unit.label.df <- cbind(unit.label.df[, c(1, 2, 4)], taxa.tbl)
+  unit.label.df[, -c(1:3)] <- apply(
+    unit.label.df[, -c(1:3)], 2,
+    function(col) sapply(strsplit(col, "__"), `[`, 2)
+  )
+  # write.table(
+  #   unit.label.df,
+  #   file = file.path(saveDir, "df_sigVarTaxRels_condsInModel.txt"),
+  #   sep = "\t", quote = F, row.names = F
+  # )
+  saveRDS(unit.label.df, file = file.path(saveDir, "df_sigVarTaxRels_condsInModel.rds"))
+  unit.label.dt <- as.data.table(unit.label.df)
+  saveRDS(unit.label.dt, file = file.path(saveDir, "dt_sigVarTAXrels_condsInModel.rds"))
+  tax.plot.list <- tax.plot.list[!sapply(tax.plot.list, is.null)]
+  nRows <- sapply(tax.plot.list, function(plot) {
+    panels <- max(as.numeric(ggplot_build(plot)$data[[1]]$PANEL))
+    if (panels > 3) {
+      nCol <- ceiling(sqrt(panels))
+      ceiling(panels / nCol)
+    } else {
+      1
+    }
+  })
+  plot.heights <- nRows / sum(nRows)
+  tax.plot.height <- ifelse(sum(nRows) / 4 < length(nRows),
+                            length(nRows) * 6,
+                            (sum(nRows) / 4) * 8
+  )
+}
+```
+
+```{r tax-network-cap}
+tax.network.cap <- ""
+```
+
+```{r cpglm-tax-network, fig.width=pnas.2col/0.9050, fig.height=pnas.max.ht, out.height=650*1.2, fig.cap=tax.network.cap, eval=FALSE}
+tax.vars.rels <- readRDS(file.path(saveDir, "dt_sigVarTAXrels_condsInModel.rds"))
+
+plot.data0 <- tax.vars.rels[
+  , 
+  .(taxComps = length(Species), Species, Slope), 
+  by = Variable
+  ]
+plot.data <- plot.data0[
+  , 
+  .(varComps = length(Variable), taxComps, Variable, Slope), 
+  by = Species
+  ]
+plot.data$Type <- ifelse(grepl("CBCL|CBQ", plot.data$Variable), "Child Behavior", "ESA")
+# plot.data$Species <- gsub("_", " ", plot.data$Species)
+
+ordered.taxa <- levels(with(plot.data, reorder(Species, varComps)))
+ordered.chb <- levels(with(plot.data[Type != "ESA"], reorder(Variable, taxComps)))
+ordered.esa <- levels(with(plot.data[Type == "ESA"], reorder(Variable, taxComps)))
+range <- c(-5, 5)
+l <- mean(range) - 1.5
+r <- mean(range) + 1.5
+seg.data <- within(plot.data, {
+  x0 <- ifelse(Type != "ESA", range[1], range[2])
+  y0 <- ifelse(Type != "ESA",
+               (match(Variable, ordered.chb) - 0.5) / length(ordered.chb),
+               (match(Variable, ordered.esa) - 0.5) / length(ordered.esa)
+  )
+  x1 <- ifelse(Type != "ESA", l, r)
+  y1 <- (match(Species, ordered.taxa) - 0.5) / length(ordered.taxa)
+  mid <- mean(range)
+})
+seg.data <- seg.data[order(abs(Slope))]
+lab.font.pt <- 6
+lab.size <- lab.font.pt * 0.35
+taxa.line <- ggplot(data = seg.data) +
+  geom_segment(aes(x = x0, xend = x1, y = y0, yend = y1, color = Slope, size = abs(Slope), alpha = abs(Slope))) +
+  scale_color_gradientn(name = "Reg. Slope", colors = blue_to_red) +
+  scale_size_continuous(name = "abs(Reg. Slope)", range = c(0.05, 1.5)) +
+  scale_alpha_continuous(name = "abs(Reg. Slope)", range = c(0.6, 0.8)) +
+  geom_tile(aes(x = mid, y = y1), width = r - l, fill = "white", color = "black") +
+  geom_text(
+    data = unique(seg.data[, .(Species, mid, y1)]), aes(x = mid, y = y1, label = Species),
+    size = lab.size, fontface = "italic"
+  ) +
+  geom_tile(
+    data = seg.data[Type != "ESA"], aes(x = x0 + l, y = y0),
+    width = r - l, height = 0.05, fill = "white", color = "black"
+  ) +
+  geom_text(
+    data = unique(seg.data[Type != "ESA", .(Variable, x0, y0)]),
+    aes(x = x0 + l, y = y0, label = Variable), size = lab.size
+  ) +
+  geom_tile(
+    data = seg.data[Type == "ESA"], aes(x = x0 + r, y = y0),
+    width = r - l, height = 0.05, fill = "white", color = "black"
+  ) +
+  geom_text(
+    data = unique(seg.data[Type == "ESA", .(Variable, x0, y0)]),
+    aes(x = x0 + r, y = y0, label = Variable), size = lab.size
+  ) +
+  scale_x_continuous(
+    breaks = c(min(seg.data$x0) + l, 0, max(seg.data$x0) + r),
+    labels = c("Behavioral Dysregulation", "Taxa", "Socioeconomic Risk"),
+    position = "top"
+  ) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(
+    panel.background = element_blank(),
+    panel.border = element_blank(),
+    axis.text.x = element_text(size = 10, face = "bold"),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_blank(),
+    axis.line = element_blank(),
+    legend.position = "bottom",
+    legend.key.size = unit(11, "pt"),
+    legend.box.margin = unit(c(0, 0, 0, 0), "pt"),
+    legend.box.spacing = unit(5, "pt")
+  )
+taxa.line
+fig.wd <- pnas.2col / 0.8887
+ggsave(taxa.line, file = file.path(figDir, "mainFig_chb_esa_tax_regNetwork.pdf"), width = fig.wd, height = 6)
+system("open -a /Applications/Inkscape.app/ Figure_plots/mainFig_chb_esa_tax_regNetwork.pdf")
+```
+
+<!-- ### KO-Covariate Relationships -->
+
+```{r cpglm-condsInModel-kos-plots-gen, eval=FALSE}
+dfsDir <- "CondsInModel_kos_DFs"
+dfsTar <- paste(dfsDir, "tgz", sep = ".")
+varPlotDir <- file.path(saveDir, "cpglm_condsInModel_kos_plots")
+if (!dir.exists(varPlotDir)) {
+  dir.create(varPlotDir)
+}
+unitPlotDir <- file.path(varPlotDir, "unit_plots")
+if (!dir.exists(unitPlotDir)) {
+  dir.create(unitPlotDir)
+}
+kos.unadj.pvals <- readRDS(
+  file = file.path(
+    saveDir, "list_kos_childSesVars_allUnits_cpglms_condsInModel_unadjPvals.rds"
+  )
+)
+kos.unadj.pvals.df <- data.frame(kos.unadj.pvals, stringsAsFactors = F) %>%
+  as.matrix() %>%
+  melt(as.is = T)
+kos.adj.pvals <- data.frame(
+  "var" = kos.unadj.pvals.df$Var1,
+  "unit" = kos.unadj.pvals.df$Var2,
+  "adj.pval" = p.adjust(kos.unadj.pvals.df$value, method = "fdr"),
+  stringsAsFactors = F
+)
+kos.sig.pvals <- droplevels(subset(kos.adj.pvals, adj.pval < 0.05))
+if (nrow(kos.sig.pvals) == 0) {
+  print("No KOs have a significant relationship with any co-variates")
+} else {
+  metadata <- as(sample_data(stool1.kos.phy), "data.frame")
+  comm.tbl <- as(otu_table(stool1.kos.phy), "matrix")
+  comm.tbl <- comm.tbl[row.names(metadata), ]
+  kos.sig.pvals$spearman.r <- apply(
+    kos.sig.pvals[, 1:2], 1,
+    function(row) {
+      cor(as.numeric(metadata[, row["var"]]),
+          comm.tbl[, row["unit"]],
+          method = "spearman",
+          use = "complete.obs"
+      )
+    }
+  )
+  my.kos.mods.clpsd <- readRDS(kegg.map.files[2])
+  my.kos.mods.clpsd$modules[my.kos.mods.clpsd$modules == "NA"] <- NA
+  my.kos.mods.clpsd$modules.names[my.kos.mods.clpsd$modules.names == "NA"] <- NA
+  # write.table(my.kos.mods.clpsd, file="~/Desktop/kos_mods_tbl.txt", sep="\t", quote=F, row.names=F)
+  my.kos.mods.clpsd$modules.names[!is.na(my.kos.mods.clpsd$modules.names)] <- paste(
+    "MODS:", my.kos.mods.clpsd$modules.names[!is.na(my.kos.mods.clpsd$modules.names)]
+  )
+  my.kos.mods.clpsd$kos.name[!is.na(my.kos.mods.clpsd$kos.name)] <- paste(
+    "KO:", my.kos.mods.clpsd$kos.name[!is.na(my.kos.mods.clpsd$kos.name)]
+  )
+  kos.sig.pvals.modIDs <- merge(kos.sig.pvals,
+                                my.kos.mods.clpsd,
+                                by.x = "unit",
+                                by.y = "kos",
+                                all.x = TRUE
+  )
+  kos.pfam.clpsd <- readRDS(file = "Static_data/kos_pfam_top5matches_clpsd.rds")
+  kos.pfam.clpsd$pfams[!is.na(kos.pfam.clpsd$pfams)] <- paste(
+    "PFAMS:", kos.pfam.clpsd$pfams[!is.na(kos.pfam.clpsd$pfams)]
+  )
+  kos.sig.pvals.modIDs.pfams <- merge(kos.sig.pvals.modIDs,
+                                      kos.pfam.clpsd,
+                                      by.x = "unit",
+                                      by.y = "kos",
+                                      all.x = TRUE
+  )
+  kos.plot.list <- list()
+  unit.label.list <- list()
+  # v <- "child_behav_CBCL_depression_t1"
+  for (v in sort(unique(kos.sig.pvals$var))) {
+    print(v)
+    var.sig.pvals <- subset(kos.sig.pvals.modIDs.pfams, var == v) %>% droplevels()
+    if (nrow(var.sig.pvals) == 0) {
+      NULL
+    } else {
+      var.data <- cbind(
+        metadata[, v, drop = F],
+        comm.tbl[, as.character(var.sig.pvals$unit), drop = F]
+      ) %>%
+        melt(id.var = v, variable.name = "unit", value.name = "rel.abund")
+      plot.data <- merge(var.data, var.sig.pvals, by = "unit", all.x = T)
+      plot.data$log.rel.abund <- log(plot.data$rel.abund)
+      unit.med.relAbund <- doBy::summaryBy(rel.abund ~ unit,
+                                           data = plot.data,
+                                           FUN = median
+      )
+      good.units <- subset(unit.med.relAbund, rel.abund.median > 0)
+      if (nrow(good.units) == 0) {
+        NULL
+      } else {
+        plot.data <- subset(plot.data, unit %in% good.units$unit)
+        label.base <- plot.data[, c(
+          "unit",
+          "spearman.r",
+          "kos.name",
+          "modules.names",
+          "pfams"
+        )] %>% unique()
+        labs <- NULL
+        for (row in c(1:nrow(label.base))) {
+          row.lab <- ifelse(
+            !is.na(label.base$modules.names[row]),
+            label.base$modules.names[row],
+            ifelse(
+              !is.na(label.base$kos.name[row]),
+              paste(label.base$kos.name[row], label.base$pfams[row], sep = " :: "),
+              label.base$pfams[row]
+            )
+          )
+          labs <- c(labs, row.lab)
+        }
+        label.base$plot.label <- labs
+        label.data <- merge(
+          label.base,
+          doBy::summaryBy(log.rel.abund ~ unit, plot.data, FUN = max),
+          by = "unit"
+        )
+        unit.label.list[[v]] <- data.frame(
+          "var" = v,
+          "unit" = label.data$unit,
+          "relationship" = ifelse(label.data$spearman.r < 0, "-",
+                                  ifelse(label.data$spearman.r > 0, "+", "flat")
+          ),
+          "label" = label.data$plot.label
+        )
+        reg.lines <- data.frame(NULL)
+        u <- unique(as.character(plot.data$unit))[1]
+        reg.slopes <- data.frame(
+          matrix(ncol = 2, nrow = length(unique(as.character(plot.data$unit))))
+        ) %>% setNames(c("unit", "reg.slope"))
+        row.names(reg.slopes) <- unique(as.character(plot.data$unit))
+        for (u in unique(as.character(plot.data$unit))) {
+          print(u)
+          model.data <- subset(plot.data, unit == u)[, c(2, 3, 11)]
+          # unit.df <- readRDS(
+          #     file.path(saveDir, dfsDir, paste("df_", v, "-", u, ".rds", sep=""))
+          # )
+          file.vu <- paste(dfsDir, "/df_", v, "-", u, ".rds", sep = "")
+          untar(file.path(saveDir, dfsTar),
+                files = file.vu,
+                compressed = "gzip"
+          )
+          unit.df <- readRDS(file.vu)
+          file.remove(file.vu)
+          file.remove(dfsDir)
+          unit.df$unit <- as.character(unit.df$unit)
+          reg.slopes[u, c("unit", "reg.slope")] <- unit.df[1, c("unit", "m")]
+          reg.lines <- rbind(reg.lines, unit.df)
+          unit.plot <- ggplot(data = model.data, aes_string(x = v, y = "log.rel.abund")) +
+            geom_abline(intercept = unit.df$b, slope = unit.df$m, color = "blue", size = 0.5) +
+            geom_point(aes(shape = ifelse(rel.abund == 0, "zero", "not zero")),
+                       alpha = 0.6
+            ) +
+            geom_text(
+              data = subset(label.data, unit == u),
+              aes(
+                label = ifelse(is.na(plot.label),
+                               "",
+                               mgsub(c(", ", "; "),
+                                     c("\n", "\n"),
+                                     plot.label,
+                                     fixed = T
+                               )
+                ),
+                x = ifelse(spearman.r < 0,
+                           max(plot.data[, v], na.rm = T),
+                           min(plot.data[, v], na.rm = T)
+                ),
+                y = log.rel.abund.max,
+                hjust = ifelse(spearman.r < 0, 1, 0)
+              ),
+              vjust = 1, size = 2.5, color = "red"
+            ) +
+            scale_shape_manual(name = "Relative abundance", values = c(16, 1)) +
+            labs(
+              y = paste("log(", u, " Rel. Abund.)", sep = ""),
+              x = mgsub(
+                c(vars.legend$var.name),
+                c(vars.legend$description),
+                v
+              ),
+              title = "Linear models on KO abundance (CPGLM)"
+            ) +
+            theme(
+              legend.position = "top",
+              legend.title = element_text(size = 18),
+              legend.text = element_text(size = 10),
+              axis.text = element_text(size = 14),
+              axis.title = element_text(size = 16),
+              strip.text = element_text(size = 16)
+            )
+          ggsave(unit.plot,
+                 file = file.path(
+                   unitPlotDir, paste(gsub(".", "_", v, fixed = T), "-", u, ".png", sep = "")
+                 ),
+                 height = 6,
+                 width = 8,
+                 dpi = 300
+          )
+        }
+        unit.label.list[[v]]$reg.slope <- reg.slopes$reg.slope
+        var.plot <- ggplot(data = plot.data, aes_string(x = v, y = "log.rel.abund")) +
+          geom_abline(
+            data = reg.lines, aes(intercept = b, slope = m),
+            color = "blue", size = 0.5
+          ) +
+          geom_point(aes(shape = ifelse(rel.abund == 0, "zero", "not zero")),
+                     alpha = 0.6
+          ) +
+          geom_text(
+            data = label.data,
+            aes(
+              label = ifelse(is.na(plot.label),
+                             "",
+                             mgsub(c(", ", "; "),
+                                   c("\n", "\n"),
+                                   plot.label,
+                                   fixed = T
+                             )
+              ),
+              x = ifelse(spearman.r < 0,
+                         max(plot.data[, v], na.rm = T),
+                         min(plot.data[, v], na.rm = T)
+              ),
+              y = log.rel.abund.max,
+              hjust = ifelse(spearman.r < 0, 1, 0)
+            ),
+            vjust = 1, size = 2.5, color = "red"
+          ) +
+          scale_shape_manual(name = "Relative abundance", values = c(16, 1)) +
+          labs(
+            y = "log(Unit Relative Abundance)",
+            x = mgsub(
+              c(vars.legend$var.name, ".resid"),
+              c(vars.legend$description, " Residuals"),
+              v
+            ),
+            title = "Linear models on KO abundance (CPGLM)"
+          ) +
+          facet_wrap(~unit, scales = "free_y") +
+          theme(
+            legend.position = "top",
+            axis.text.y = element_blank()
+          )
+        kos.plot.list[[v]] <- var.plot
+        nCol <- ceiling(sqrt(length(unique(plot.data$unit))))
+        nRow <- ceiling(length(unique(plot.data$unit)) / nCol)
+        ggsave(
+          var.plot,
+          file = file.path(varPlotDir, paste(gsub(".", "_", v, fixed = T), "png", sep = ".")),
+          height = nRow * 2,
+          width = 8,
+          dpi = 300
+        )
+      }
+    }
+  }
+  # kos.plot.list <- kos.plot.list[!sapply(kos.plot.list, is.null)]
+  # unit.label.df <- do.call("rbind", e$unit.label.list)
+  unit.label.df <- do.call("rbind", unit.label.list)
+  unit.label.df[, 1:4] <- apply(unit.label.df[, 1:4], 2, as.character)
+  row.names(unit.label.df) <- NULL
+  unit.label.df$var <- mgsub(
+    c(vars.legend$var.name, ".resid"),
+    c(vars.legend$description, " Residuals"),
+    unit.label.df$var
+  )
+  names(unit.label.df) <- c("Variable", "Unit", "Relationship", "Label", "Slope")
+  write.table(
+    unit.label.df,
+    file = file.path(saveDir, "df_sigVarKOrels_condsInModel.txt"),
+    sep = "\t", quote = F, row.names = F
+  )
+  saveRDS(unit.label.df, file = file.path(saveDir, "df_sigVarKOrels_condsInModel.rds"))
+  unit.label.dt <- as.data.table(unit.label.df)
+  mods.label.dt <- unit.label.dt[grepl("MODS", Label, ignore.case = F)]
+  write.table(mods.label.dt,
+              file = file.path(saveDir, "df_sigVarMODrels_condsInModel.txt"),
+              sep = "\t", quote = F, row.names = F
+  )
+  saveRDS(mods.label.dt, file = file.path(saveDir, "dt_sigVarMODrels_condsInModel.rds"))
+  
+  nRows <- sapply(kos.plot.list, function(plot) {
+    panels <- max(as.numeric(ggplot_build(plot)$data[[1]]$PANEL))
+    nCol <- ceiling(sqrt(panels))
+    ceiling(panels / nCol)
+  })
+  plot.heights <- nRows / sum(nRows)
+  kos.plot.height <- ifelse(sum(nRows) / 4 < length(nRows),
+                            length(nRows) * 8,
+                            (sum(nRows) / 4) * 6
+  )
+}
+```
+
+```{r kos-network-cap}
+kos.network.cap <- ""
+```
+
+```{r cpglm-kos-network, fig.width=pnas.2col/0.9050, fig.height=pnas.max.ht/0.9230, out.height=650*1.2, fig.cap=kos.network.cap, eval=FALSE}
+fig.wd <- pnas.2col / 0.8887
+fig.ht <- pnas.max.ht / 0.965
+lab.font.pt <- 6
+mods.vars.rels <- readRDS(file.path(saveDir, "dt_sigVarMODrels_condsInModel.rds"))
+### remove animal/plant-only Mods
+mods.vars.rels <- subset(mods.vars.rels, !(Unit %in% c("K06225", "K03064")))
+mods.vars.rels$Label <- sapply(
+  strsplit(sub("MODS: ", "", unlist(strsplit(mods.vars.rels$Label, " KO:"))), ","),
+  `[`, 1
+)
+#
+plot.data0 <- mods.vars.rels[, .(modComps = length(Label), Label, Slope), by = Variable]
+plot.data <- plot.data0[
+  , 
+  .(varComps = length(Variable), modComps, Variable, Slope), 
+  by = Label
+  ]
+plot.data$Type <- ifelse(grepl("CBCL|CBQ", plot.data$Variable), "Child Behavior", "ESA")
+# plot.data$Label <- strtrim(plot.data$Label, median(nchar(plot.data$Label)))
+# grep("manno-heptose", unique(plot.data$Label), value=F)
+
+new.par <- par(ps = lab.font.pt, family = "Helvetica", fin = c(fig.wd, fig.ht))
+to.replace <- data.frame(
+  "word" = c(
+    "pathway", "; ", "beta", "biosynthesis",
+    "system", "polysaccharide", "regulatory", "transport",
+    "two", "component", "degradation", "pathogenicity",
+    "signature", "deoxyribonuleotide", "zinc", "manganese",
+    "; Cell cycle - G2/M transition", "antimicrobial peptide", "sulfate", "Putative",
+    "phosphate", "hydroxymethylpyrimidine", "oligosaccharyltransferase", "Oxidation",
+    "semialdehyde", "Entner-Doudoroff", "ADP-L-glycero-D-manno-heptose",
+    "BRCA1-associated genome surveillance complex ", "; MRX complex"
+  ),
+  "replace" = c(
+    "ptwy", ";", "β", "biosyn",
+    "sys", "polysac", "reg", "transp",
+    "2", "comp", "degrad", "pathogenic",
+    "signtr", "dNMP", "Zn", "Mn",
+    "", "AMP", "SO4", "Put.",
+    "PO4", "HMP", "OST", "oxid'n",
+    "semialdhd", "ED", "ADP-LDHep",
+    "", ""
+  ),
+  stringsAsFactors = F
+)
+max.wd <- 1.26
+for (l in 1:length(plot.data$Label)) {
+  lab <- plot.data$Label[l]
+  lab <- sub("\\(.+\\)[ ;] *", "", lab)
+  wd0 <- strwidth(lab, units = "inches")
+  if (wd0 > max.wd) {
+    lab <- mgsub(to.replace$word, to.replace$replace, lab)
+    wd1 <- strwidth(lab, units = "inches")
+    if (wd1 > max.wd) {
+      lab <- sub(";.+", "", lab)
+      wd2 <- strwidth(lab, units = "inches")
+      if (wd2 > max.wd) {
+        print(lab, quote = F)
+      }
+    }
+  }
+  plot.data$Label[l] <- lab
+}
+par(.pardefault)
+ordered.mods <- levels(with(plot.data, reorder(Label, varComps)))
+ordered.chb <- levels(with(plot.data[Type != "ESA"], reorder(Variable, modComps)))
+ordered.esa <- levels(with(plot.data[Type == "ESA"], reorder(Variable, modComps)))
+range <- c(-5, 5)
+l <- mean(range) - 1.5
+r <- mean(range) + 1.5
+seg.data <- within(plot.data, {
+  x0 <- ifelse(Type != "ESA", range[1], range[2])
+  y0 <- ifelse(Type != "ESA",
+               (match(Variable, ordered.chb) - 0.5) / length(ordered.chb),
+               (match(Variable, ordered.esa) - 0.5) / length(ordered.esa)
+  )
+  x1 <- ifelse(Type != "ESA", l, r)
+  y1 <- (match(Label, ordered.mods) - 0.5) / length(ordered.mods)
+  mid <- mean(range)
+})
+seg.data$Variable <- sub("/", "/\n", seg.data$Variable)
+seg.data <- seg.data[order(abs(Slope))]
+lab.size <- lab.font.pt * 0.35
+mods.line <- ggplot(data = seg.data) +
+  geom_segment(
+    aes(
+      x = x0, xend = x1, 
+      y = y0, yend = y1, 
+      color = Slope, 
+      size = abs(Slope), 
+      alpha = abs(Slope)
+      )
+    ) +
+  scale_color_gradientn(name = "Reg. Slope", colors = blue_to_red) +
+  scale_size_continuous(name = "abs(Reg. Slope)", range = c(0.05, 1.5)) +
+  scale_alpha_continuous(name = "abs(Reg. Slope)", range = c(0.6, 0.8)) +
+  geom_tile(aes(x = mid, y = y1), width = r - l, fill = "white", color = "black") +
+  geom_text(
+    data = unique(seg.data[, .(Label, mid, y1)]),
+    aes(x = mid, y = y1, label = Label),
+    size = lab.size
+  ) +
+  geom_tile(
+    data = seg.data[Type != "ESA"], aes(x = x0 + l, y = y0),
+    width = r - l, height = 0.05, fill = "white", color = "black"
+  ) +
+  geom_text(
+    data = unique(seg.data[Type != "ESA", .(Variable, x0, y0)]),
+    aes(x = x0 + l, y = y0, label = Variable),
+    size = lab.size
+  ) +
+  geom_tile(
+    data = seg.data[Type == "ESA"], aes(x = x0 + r, y = y0),
+    width = r - l, height = 0.05, fill = "white", color = "black"
+  ) +
+  geom_text(
+    data = unique(seg.data[Type == "ESA", .(Variable, x0, y0)]),
+    aes(x = x0 + r, y = y0, label = Variable),
+    size = lab.size
+  ) +
+  scale_x_continuous(
+    breaks = c(min(seg.data$x0) + l, 0, max(seg.data$x0) + r),
+    labels = c("Behavioral Dyregulation", "Functional Modules", "Socioeconomic Risk"),
+    position = "top"
+  ) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(
+    panel.border = element_blank(),
+    axis.text.x = element_text(size = 10, face = "bold"),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_blank(),
+    axis.line = element_blank(),
+    legend.position = "bottom",
+    legend.key.size = unit(11, "pt"),
+    legend.box.margin = unit(c(0, 0, 0, 0), "pt"),
+    legend.box.spacing = unit(5, "pt")
+  )
+mods.line
+
+ggsave(mods.line, file=file.path(figDir, "mainFig_chb_esa_kos_regNetwork.pdf"), width=fig.wd, height=fig.ht)
+system("open -a /Applications/Inkscape.app/ Figure_plots/mainFig_chb_esa_kos_regNetwork.pdf")
+
+###  ISSC Talk FIG
+# fig.wd <- pnas.2col/0.8887
+mods.leg <- cowplot::get_legend(mods.line)
+mods.line <- mods.line + theme(legend.position = "none")
+ggsave(mods.line, file = file.path(figDir, "mainFig_chb_esa_kos_regNetwork.pdf"), width=fig.wd, height=fig.ht)
+ggsave(mods.leg, file = file.path(figDir, "mainFig_chb_esa_kos_regNetwork_legend.pdf"))
+system("open -a /Applications/Inkscape.app/ Figure_plots/mainFig_chb_esa_kos_regNetwork.pdf")
+# ggsave(mods.line,
+#        file = "~/Google Drive/OSU/OSU_Home_Sync/ISSC_talk/mainFig_chb_esa_kos_regNetwork.pdf",
+#        width = 190, height = 190 * (fig.ht / fig.wd), units = "mm"
+# )
+# # system("open '/Users/stagamak/Google Drive/OSU/OSU_Home_Sync/ISSC_talk/mainFig_chb_esa_kos_regNetwork.pdf'")
+# system("open -a /Applications/Inkscape.app/ '/Users/stagamak/Google Drive/OSU/OSU_Home_Sync/ISSC_talk/mainFig_chb_esa_kos_regNetwork.pdf'")
+
+```
+
+<!-- ### T6SS KOs/Modules and Taxa Relationships -->
+
+```{r t6ss-taxa, fig.height=pnas.2col, eval=FALSE}
+set.seed(main.seed)
+kos.df <- readRDS(file = file.path(saveDir, "df_sigVarKOrels_condsInModel.rds"))
+kos.dt <- as.data.table(kos.df)
+t6ss.dt <- kos.dt[grepl("type VI", Label, ignore.case = T)]
+t6ss.kos <- sort(unique(t6ss.dt$Unit))
+kos.tbl <- as(otu_table(stool1.kos.phy), "matrix")
+t6ss.tbl <- kos.tbl[, t6ss.kos]
+t6ss.m.dt <- melt(t6ss.tbl, varnames = c("smpl", "kos"), value.name = "rel.kos.abund") %>% as.data.table()
+tax.tbl <- as(otu_table(stool1.tax.phy), "matrix")
+tax.m.dt <- melt(tax.tbl, varnames = c("smpl", "taxon"), value.name = "rel.tax.abund") %>% as.data.table()
+t6ss.tax.data <- merge(tax.m.dt, t6ss.m.dt, by = "smpl", all = T, allow.cartesian = T)
+cpglm.res <- data.frame()
+# txn <- colnames(tax.tbl)[1]
+# t6.ko <- t6ss.kos[1]
+for (txn in colnames(tax.tbl)) {
+  for (t6.ko in t6ss.kos) {
+    comp.data <- t6ss.tax.data[taxon == txn & kos == t6.ko]
+    if (median(comp.data$rel.tax.abund) > 0 & median(comp.data$rel.kos.abund) > 0) {
+      comp.data$log.kos.abund <- log(comp.data$rel.kos.abund)
+      tax.t6.cpglm <- try(
+        cpglm(rel.tax.abund ~ log.kos.abund, data = comp.data),
+        silent = T
+      )
+      if (class(tax.t6.cpglm) != "try-error") {
+        sink(file = "tmp.txt")
+        model.sum <- summary(tax.t6.cpglm)
+        sink()
+        pval <- model.sum$coefficients[2, "Pr(>|t|)"]
+        slope <- unname(tax.t6.cpglm$coefficients[2])
+        intercept <- unname(tax.t6.cpglm$coefficients[1])
+        cpglm.df <- data.frame(
+          "taxon" = txn,
+          "kos" = t6.ko,
+          "m" = slope,
+          "b" = intercept,
+          "unadj.p" = pval
+        )
+        cpglm.res <- rbind(cpglm.res, cpglm.df)
+      }
+    }
+  }
+}
+# View(cpglm.res)
+cpglm.res$adj.p <- p.adjust(cpglm.res$unadj.p, method = "fdr")
+cpglm.res <- as.data.table(cpglm.res)
+sig.assoc <- cpglm.res[adj.p <= 0.05]
+# View(sig.assoc)
+sig.assoc$n <- LETTERS[1:nrow(sig.assoc)]
+sig.assoc <- within(sig.assoc, {
+  tax.species <- str_extract(taxon, "s__[a-zA-Z0-9 _]+")
+  tax.species <- mgsub(c("s__", "_bacterium"), c("", "", "715"), tax.species)
+  # plot.lab <- paste(n, " ", tax.species, "\n", kos, sep="")
+})
+sig.assoc$plot.lab <- factor(sig.assoc$plot.lab, levels = unique(sig.assoc$plot.lab))
+# # sig.cors$taxon
+sig.t6ss.tax <- t6ss.tax.data[sig.assoc, on = c(taxon = "taxon", kos = "kos")]
+sig.t6ss.tax <- within(sig.t6ss.tax, {
+  shp <- ifelse(rel.kos.abund == 0 & rel.tax.abund == 0, "zero-zero",
+                ifelse(rel.kos.abund == 0, "ko-zero",
+                       ifelse(rel.tax.abund == 0, "tax-zero", "no-zero")
+                )
+  )
+})
+
+t6ss.tax.plot <- ggplot(data = sig.t6ss.tax) +
+  geom_abline(
+    data = sig.assoc, aes(intercept = b, slope = m),
+    color = "blue", size = 0.5
+  ) +
+  geom_point(aes(x = log(rel.kos.abund), y = log(rel.tax.abund), shape = shp), alpha = 0.6) +
+  scale_shape_manual(name = "Relative abundance", values = c(16, 1), labels = c("not zero", "zero")) +
+  labs(
+    y = "log(Taxon Relative Abundance)",
+    x = "log(KO Relative Abundance)"
+  ) +
+  facet_wrap(~n, scales = "free") +
+  theme(
+    legend.position = "top",
+    strip.text = element_text(hjust = 0)
+  )
+plot.grob <- arrangeGrob(t6ss.tax.plot)
+t6ss.dt$Tbl.Label <- mgsub(c(":: ", "; "), c("\n", "\n    "), t6ss.dt$Label)
+
+tax.kos <- sig.assoc[, .(Panel = n, Taxon = gsub("_", " ", tax.species), KO = kos)]
+ff <- matrix(c(1, 3, 1), ncol = ncol(tax.kos), nrow = nrow(tax.kos), byrow = T)
+tt1 <- ttheme_default(base_size = 8, core = list(fg_params = list(fontface = as.vector(ff))))
+tax.ko.tbl <- tableGrob(tax.kos,
+                        rows = NULL, theme = tt1
+)
+
+kos.labs <- unique(t6ss.dt[order(Unit), .(KO = Unit, Label = Tbl.Label)])
+hj <- matrix(c(0.5, 0), ncol = ncol(kos.labs), nrow = nrow(kos.labs), byrow = T)
+x <- matrix(c(0.5, 0.01), ncol = ncol(kos.labs), nrow = nrow(kos.labs), byrow = T)
+
+tt2 <- ttheme_default(
+  core = list(fg_params = list(hjust = as.vector(hj), x = as.vector(x))),
+  colhead = list(fg_params = list(hjust = c(0.5, 0), x = c(0.5, 0.01))),
+  base_size = 8
+)
+ko.lab.tbl <- tableGrob(kos.labs, rows = NULL, theme = tt2)
+table.grob <- arrangeGrob(tax.ko.tbl, ko.lab.tbl, nrow = 1)
+
+t6ss.fig <- arrangeGrob(plot.grob, table.grob,
+                        nrow = 2,
+                        heights = c(0.6, 0.4)
+)
+ggsave(t6ss.fig,
+       file = file.path(figDir, "suppFig_t6ss_tax_regs.pdf"),
+       width = pnas.2col + 2.5, height = pnas.max.ht + 2
+)
+system(paste("open", file.path(figDir, "suppFig_t6ss_tax_regs.pdf")))
+system(paste("open -a /Applications/Inkscape.app", file.path(figDir, "suppFig_t6ss_tax_regs.pdf")))
+```
+
+```{r addressing-some-reviewer-comments, eval=FALSE}
+smpl.data <- as(sample_data(stool1.kos.phy), "data.frame")
+ggplot(smpl.data, aes(x = parent_PSI_PC_dysfunc_t1, y = esa_LEC_Turmoil_Combined)) + 
+  geom_point()
+cor.test(smpl.data$parent_PSI_PC_dysfunc_t1, smpl.data$esa_LEC_Turmoil_Combined)
+cor.test(
+  smpl.data$parent_PSI_PC_dysfunc_t1, 
+  smpl.data$esa_LEC_Turmoil_Combined, 
+  method = "spearman"
+  )
+
+ggplot(smpl.data, aes(x = parent_PSI_PC_dysfunc_t1, y = child_behav_CBCL_depression_t1)) + 
+  geom_point()
+ggsave(file = "Figure_plots/parent-child_dys_vs_CBCL-depression_plot.pdf")
+cor.test(smpl.data$parent_PSI_PC_dysfunc_t1, smpl.data$child_behav_CBCL_depression_t1)
+cor.test(
+  smpl.data$parent_PSI_PC_dysfunc_t1, 
+  smpl.data$child_behav_CBCL_depression_t1, 
+  method = "spearman"
+  )
+```
+
